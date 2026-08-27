@@ -1,0 +1,82 @@
+:root {
+  font-family: Inter, "Microsoft YaHei", "PingFang SC", system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  color: #243b53;
+  background: #f4f7f8;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+
+  /* 紫色主题（对齐主分支设计令牌） */
+  --color-primary: #7b3fb2;
+  --color-primary-dark: #63308f;
+  --color-primary-accent: #6f329b;
+  --color-primary-light: rgba(111, 50, 155, 0.08);
+  --color-primary-border: rgba(111, 50, 155, 0.14);
+  --color-primary-border-strong: rgba(111, 50, 155, 0.22);
+  --color-bg: #f4f7f8;
+  --color-bg-sidebar: #fbfcfd;
+  --color-bg-card: #ffffff;
+  --color-bg-hover: rgba(111, 50, 155, 0.05);
+  --color-bg-active: rgba(111, 50, 155, 0.1);
+  --color-bg-gray: #eef2f5;
+  --color-border: #d9e2ec;
+  --color-text-dark: #3a2a55;
+  --color-text-medium: #5f4d77;
+  --color-text-light: #8b8398;
+  --color-text-lighter: #a89fb6;
+  --color-text-body: #243b53;
+  --color-success: #2f8a56;
+  --color-success-bg: rgba(54, 156, 99, 0.12);
+  --color-warning: #b9821f;
+  --color-warning-bg: rgba(214, 158, 46, 0.14);
+  --color-error: #c0392b;
+  --color-error-bg: rgba(208, 80, 80, 0.06);
+  --color-error-border: rgba(208, 80, 80, 0.3);
+  --color-info: #2f5e9a;
+  --color-info-bg: rgba(63, 110, 178, 0.06);
+  --radius-sm: 5px;
+  --radius-md: 6px;
+  --radius-lg: 8px;
+  --radius-pill: 999px;
+  --shadow-card: 0 6px 18px rgba(47, 22, 82, 0.06);
+  --shadow-hover: 0 6px 16px rgba(111, 50, 155, 0.28);
+  --shadow-dropdown: 0 12px 30px rgba(47, 22, 82, 0.14);
+  --gradient-primary: linear-gradient(180deg, #7b3fb2, #63308f);
+}
+
+* { box-sizing: border-box; }
+
+html, body, #app { min-width: 320px; height: 100%; }
+
+body {
+  margin: 0;
+  height: 100vh;
+  background: #f4f7f8;
+}
+
+button, input, textarea, select { font-family: inherit; }
+button:focus-visible, input:focus-visible, textarea:focus-visible, a:focus-visible {
+  outline: 2px solid #6f329b;
+  outline-offset: 2px;
+}
+
+a { color: #7b3fb2; text-decoration: none; }
+a:hover { text-decoration: underline; }
+
+::selection { background: rgba(111, 50, 155, 0.2); }
+
+::-webkit-scrollbar { width: 7px; height: 7px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { border-radius: 4px; background: rgba(111, 50, 155, 0.2); }
+::-webkit-scrollbar-thumb:hover { background: rgba(111, 50, 155, 0.4); }
+
+.truncate { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    scroll-behavior: auto !important;
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}
