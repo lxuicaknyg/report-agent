@@ -1,7 +1,7 @@
 import { defineStore } from 'pinia'
 import { ref, computed } from 'vue'
 import type { ConversationSession, Task } from '../types'
-import { conversationApi } from '../services/api'
+import { conversationApi, type SubmitTaskAttachmentRef } from '../services/api'
 import { taskApi } from '../services/api'
 
 const LS_SESSIONS_KEY = 'report-agent:sessions-v1'
@@ -174,11 +174,18 @@ export const useConversationStore = defineStore('conversation', () => {
     }
   }
 
-  async function sendMessage(content: string): Promise<Task | null> {
+  async function sendMessage(
+    content: string,
+    opts?: { attachments?: SubmitTaskAttachmentRef[] },
+  ): Promise<Task | null> {
     if (!currentSessionId.value) return null
     isSending.value = true
     try {
-      const result = await conversationApi.submitTask(currentSessionId.value, content)
+      const result = await conversationApi.submitTask(
+        currentSessionId.value,
+        content,
+        { attachments: opts?.attachments },
+      )
       if (result.success && result.data) {
         const task = result.data
         tasks.value.push(task)

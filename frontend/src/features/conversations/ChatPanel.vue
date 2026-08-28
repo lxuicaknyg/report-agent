@@ -8,7 +8,28 @@ import StreamContent from './StreamContent.vue'
 import SlashCommandMenu, { type SlashCommandItem } from './SlashCommandMenu.vue'
 import { useAllTaskStreams } from '../../composables/useAllTaskStreams'
 import { sseClient } from '../../services/events'
-import { taskApi } from '../../services/api'
+import { taskApi, type SubmitTaskAttachmentRef } from '../../services/api'
+
+type UploadKind = 'word' | 'pdf' | 'excel'
+
+type LocalAttachment = {
+  file_id: string
+  filename: string
+  kind: UploadKind
+  size: number
+}
+
+const ACCEPT_MAP: Record<UploadKind, string> = {
+  word: '.doc,.docx',
+  pdf: '.pdf',
+  excel: '.xls,.xlsx',
+}
+
+const KIND_LABEL: Record<UploadKind, string> = {
+  word: 'Word 文档',
+  pdf: 'PDF 文件',
+  excel: 'Excel 表格',
+}
 
 const SLASH_COMMANDS: SlashCommandItem[] = [
   {
@@ -42,6 +63,26 @@ const inputValue = ref('')
 const messagesContainer = ref<HTMLElement | null>(null)
 const inputRef = ref<HTMLTextAreaElement | null>(null)
 const composerRef = ref<HTMLDivElement | null>(null)
+
+const submitFailed = ref(false)
+let submitFailedHideTimer: ReturnType<typeof setTimeout> | null = null
+
+function showSubmitFailedBanner() {
+  submitFailed.value = true
+  if (submitFailedHideTimer) clearTimeout(submitFailedHideTimer)
+  submitFailedHideTimer = setTimeout(() => {
+    submitFailed.value = false
+    submitFailedHideTimer = null
+  }, 4200)
+}
+
+function dismissSubmitFailed() {
+  submitFailed.value = false
+  if (submitFailedHideTimer) {
+    clearTimeout(submitFailedHideTimer)
+    submitFailedHideTimer = null
+  }
+}
 
 const slashVisible = ref(false)
 const slashQuery = ref('')
@@ -183,6 +224,14 @@ onMounted(() => {
     }
   })
 
+  sseClient.on('task.completed', (event) => {
+    const taskId = event.task_id
+    if (taskId) {
+      handleSSEStreamingCompleted(taskId)
+      cleanup(taskId)
+    }
+  })
+
   nextTick(() => inputRef.value?.focus())
 })
 
@@ -233,6 +282,96 @@ const composerPlaceholder = computed(() => {
   return '描述你的数据分析需求，AI 将自动规划执行步骤'
 })
 
+/* ── 附件上传：+ 按钮（Word / PDF / Excel） ── */
+const attachments = ref<LocalAttachment[]>([])
+const uploadMenuVisible = ref(false)
+const activeUploadKind = ref<UploadKind | null>(null)
+const uploadInputRef = ref<HTMLInputElement | null>(null)
+let uploadMenuHideTimer: ReturnType<typeof setTimeout> | null = null
+
+function clearUploadMenuHideTimer() {
+  if (uploadMenuHideTimer) {
+    clearTimeout(uploadMenuHideTimer)
+    uploadMenuHideTimer = null
+  }
+}
+
+function scheduleHideUploadMenu() {
+  clearUploadMenuHideTimer()
+  uploadMenuHideTimer = window.setTimeout(() => hideUploadMenu(), 160)
+}
+
+function handlePlusBtnBlur() {
+  scheduleHideUploadMenu()
+}
+
+function hideUploadMenu() {
+  uploadMenuVisible.value = false
+  activeUploadKind.value = null
+}
+
+function openUploadForKind(kind: UploadKind) {
+  activeUploadKind.value = kind
+  hideUploadMenu()
+  nextTick(() => {
+    if (uploadInputRef.value) {
+      uploadInputRef.value.accept = ACCEPT_MAP[kind]
+      uploadInputRef.value.value = ''
+      uploadInputRef.value.click()
+    }
+  })
+}
+
+function toggleUploadMenu() {
+  if (uploadMenuVisible.value) {
+    hideUploadMenu()
+    return
+  }
+  clearUploadMenuHideTimer()
+  uploadMenuVisible.value = true
+}
+
+function handleFilesSelected(e: Event) {
+  const input = e.target as HTMLInputElement
+  if (!input.files || input.files.length === 0) return
+  const kind = activeUploadKind.value
+  for (let i = 0; i < input.files.length; i += 1) {
+    const f = input.files[i]
+    attachments.value.push({
+      file_id: `local_${Date.now()}_${i.toString().padStart(3, '0')}`,
+      filename: f.name,
+      kind: kind ?? detectKindByFilename(f.name),
+      size: f.size,
+    })
+  }
+  nextTick(() => scrollToBottom())
+}
+
+function detectKindByFilename(name: string): UploadKind {
+  const ext = name.toLowerCase()
+  if (ext.endsWith('.pdf')) return 'pdf'
+  if (ext.endsWith('.xls') || ext.endsWith('.xlsx')) return 'excel'
+  return 'word'
+}
+
+function removeAttachment(fileId: string) {
+  attachments.value = attachments.value.filter((a) => a.file_id !== fileId)
+}
+
+function formatFileSize(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`
+  return `${(bytes / 1024 / 1024).toFixed(1)} MB`
+}
+
+function currentAcceptStr(): string {
+  const s = new Set<string>()
+  for (const v of Object.values(ACCEPT_MAP)) {
+    v.split(',').forEach((x) => s.add(x))
+  }
+  return [...s].join(',')
+}
+
 watch([() => props.tasks], async () => {
   await nextTick()
   scrollToBottom()
@@ -240,20 +379,42 @@ watch([() => props.tasks], async () => {
 
 async function handleSend() {
   const content = inputValue.value.trim()
-  if (!content || conversationStore.isSending) return
+  if ((!content && attachments.value.length === 0) || conversationStore.isSending) return
 
   if (!conversationStore.currentSessionId) {
     await conversationStore.createSession('新会话')
   }
 
-  const task = await conversationStore.sendMessage(content)
+  const sessionIdBefore = conversationStore.currentSessionId
+  const apiAttachments: SubmitTaskAttachmentRef[] = attachments.value.map((a) => ({
+    file_id: a.file_id,
+    filename: a.filename,
+    kind: a.kind,
+  }))
+  const prompt = content
+    ? content
+    : (apiAttachments.length > 0
+      ? `附件：${apiAttachments.map((a) => a.filename).join('、')}`
+      : '')
+  const task = await conversationStore.sendMessage(prompt, { attachments: apiAttachments })
+  attachments.value = []
   inputValue.value = ''
   await nextTick(() => autoGrow())
   scrollToBottom()
 
-  if (task) {
-    sseClient.connect(task.id)
+  if (sessionIdBefore && conversationStore.currentSessionId === sessionIdBefore) {
+    conversationStore.updateConversationTitle(
+      sessionIdBefore,
+      content || prompt,
+    )
   }
+
+  if (!task) {
+    showSubmitFailedBanner()
+    return
+  }
+
+  sseClient.connect(task.id)
 }
 
 function scrollToBottom() {
@@ -296,6 +457,19 @@ function handleKeydown(event: KeyboardEvent) {
         return
       }
     }
+  }
+  if (uploadMenuVisible.value) {
+    if (event.key === 'Escape') {
+      event.preventDefault()
+      hideUploadMenu()
+      return
+    }
+  }
+  if (event.key === 'Escape') {
+    if (inputRef.value) {
+      inputRef.value.blur()
+    }
+    return
   }
   if (event.key === 'Enter' && !event.shiftKey && !event.isComposing) {
     event.preventDefault()
@@ -372,10 +546,31 @@ function handleFollowupClick(question: string) {
     }
   })
 }
+
+function pickExampleChip(text: string) {
+  if (!text || !text.trim()) return
+  inputValue.value = text.trim()
+  nextTick(() => {
+    autoGrow()
+    if (inputRef.value) {
+      inputRef.value.focus()
+      const len = inputRef.value.value.length
+      inputRef.value.setSelectionRange(len, len)
+    }
+  })
+}
 </script>
 
 <template>
   <div class="chat-panel">
+    <div
+      v-if="submitFailed"
+      class="submit-failed-banner"
+      role="alert"
+    >
+      <span class="submit-failed-text">后端对话服务暂未上线（404），请稍后再试或联系管理员部署接口。</span>
+      <button type="button" class="submit-failed-close" aria-label="关闭提示" @click="dismissSubmitFailed">×</button>
+    </div>
     <div ref="messagesContainer" class="chat-scroll">
       <div class="chat-inner">
         <!-- 空态：欢迎语 -->
@@ -388,7 +583,7 @@ function handleFollowupClick(question: string) {
               :key="ex"
               type="button"
               class="welcome-chip"
-              @click="inputValue = ex"
+              @click="pickExampleChip(ex)"
             >{{ ex }}</button>
           </div>
         </div>
@@ -428,7 +623,12 @@ function handleFollowupClick(question: string) {
                     <div class="ac-goal-text">{{ task.plan.summary }}</div>
                   </div>
                   <div v-else-if="task.status === 'created' || task.status === 'planning'" class="ac-goal">
-                    <div class="ac-goal-label muted">正在规划执行步骤…</div>
+                    <div class="ac-goal-label muted flex-row">
+                      <span>正在规划执行步骤</span>
+                      <span class="loading-dots" aria-hidden="true">
+                        <span /><span /><span />
+                      </span>
+                    </div>
                   </div>
                   <div v-if="task.plan && task.plan.steps.length > 0" class="ac-timeline">
                     <StepTimeline :steps="task.plan.steps" />
@@ -517,22 +717,112 @@ function handleFollowupClick(question: string) {
         :active-index="slashActiveIndex"
         @pick="pickSlashItem"
       />
+      <div
+        v-if="uploadMenuVisible"
+        class="upload-menu"
+      >
+        <button
+          type="button"
+          class="upload-menu-item"
+          @click="openUploadForKind('word')"
+        >
+          <span class="upload-menu-icon word">W</span>
+          <div class="upload-menu-meta">
+            <div class="upload-menu-title">上传 Word 文档</div>
+            <div class="upload-menu-desc">.doc / .docx</div>
+          </div>
+        </button>
+        <button
+          type="button"
+          class="upload-menu-item"
+          @click="openUploadForKind('pdf')"
+        >
+          <span class="upload-menu-icon pdf">P</span>
+          <div class="upload-menu-meta">
+            <div class="upload-menu-title">上传 PDF 文件</div>
+            <div class="upload-menu-desc">.pdf</div>
+          </div>
+        </button>
+        <button
+          type="button"
+          class="upload-menu-item"
+          @click="openUploadForKind('excel')"
+        >
+          <span class="upload-menu-icon excel">X</span>
+          <div class="upload-menu-meta">
+            <div class="upload-menu-title">上传 Excel 表格</div>
+            <div class="upload-menu-desc">.xls / .xlsx</div>
+          </div>
+        </button>
+      </div>
+      <input
+        ref="uploadInputRef"
+        type="file"
+        style="display: none;"
+        :accept="currentAcceptStr()"
+        multiple
+        @change="handleFilesSelected"
+      />
       <div class="composer-inner">
-        <textarea
-          ref="inputRef"
-          v-model="inputValue"
-          class="composer-input"
-          :placeholder="composerPlaceholder"
-          rows="1"
-          @keydown="handleKeydown"
-          @input="handleInputChange(); autoGrow()"
-          @focus="clearSlashHideTimer()"
-          @blur="handleComposerBlur"
-        />
+        <button
+          type="button"
+          class="plus-btn"
+          :class="{ active: uploadMenuVisible }"
+          @click="toggleUploadMenu"
+          @focus="clearUploadMenuHideTimer()"
+          @blur="handlePlusBtnBlur"
+          aria-label="添加附件"
+          title="添加附件"
+        >
+          <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <line x1="12" y1="5" x2="12" y2="19" />
+            <line x1="5" y1="12" x2="19" y2="12" />
+          </svg>
+        </button>
+        <div class="composer-input-wrap">
+          <div v-if="attachments.length > 0" class="attachment-chips">
+            <div
+              v-for="a in attachments"
+              :key="a.file_id"
+              class="attachment-chip"
+            >
+              <span class="attachment-icon" :class="a.kind">
+                {{ a.kind === 'word' ? 'W' : a.kind === 'pdf' ? 'P' : 'X' }}
+              </span>
+              <div class="attachment-meta">
+                <span class="attachment-name" :title="a.filename">{{ a.filename }}</span>
+                <span class="attachment-size">{{ formatFileSize(a.size) }} · {{ KIND_LABEL[a.kind] }}</span>
+              </div>
+              <button
+                type="button"
+                class="attachment-remove"
+                aria-label="移除附件"
+                title="移除附件"
+                @click.stop="removeAttachment(a.file_id)"
+              >
+                <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                  <line x1="18" y1="6" x2="6" y2="18" />
+                  <line x1="6" y1="6" x2="18" y2="18" />
+                </svg>
+              </button>
+            </div>
+          </div>
+          <textarea
+            ref="inputRef"
+            v-model="inputValue"
+            class="composer-input"
+            :placeholder="composerPlaceholder"
+            rows="1"
+            @keydown="handleKeydown"
+            @input="handleInputChange(); autoGrow()"
+            @focus="clearSlashHideTimer()"
+            @blur="handleComposerBlur"
+          />
+        </div>
         <button
           class="send-btn"
           @click="handleSend"
-          :disabled="conversationStore.isSending || (!inputValue.trim())"
+          :disabled="conversationStore.isSending || (!inputValue.trim() && attachments.length === 0)"
         >
           <span v-if="conversationStore.isSending" class="spinner-small" />
           <span v-else>发送</span>
@@ -1002,6 +1292,84 @@ function handleFollowupClick(question: string) {
   color: var(--color-text-light);
 }
 
+.flex-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.loading-dots {
+  display: inline-flex;
+  gap: 4px;
+  line-height: 1;
+}
+
+.loading-dots span {
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: var(--color-primary);
+  opacity: 0.25;
+  animation: loading-dots-bounce 1.2s infinite ease-in-out both;
+}
+
+.loading-dots span:nth-child(1) {
+  animation-delay: -0.32s;
+}
+
+.loading-dots span:nth-child(2) {
+  animation-delay: -0.16s;
+}
+
+@keyframes loading-dots-bounce {
+  0%, 80%, 100% {
+    opacity: 0.2;
+    transform: scale(0.9);
+  }
+  40% {
+    opacity: 1;
+    transform: scale(1.15);
+  }
+}
+
+.submit-failed-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin: 12px 20px 0;
+  padding: 10px 14px;
+  background: #fff7ed;
+  border: 1px solid #fdba74;
+  border-radius: 10px;
+  flex-shrink: 0;
+}
+
+.submit-failed-text {
+  flex: 1;
+  font-size: 13px;
+  color: #9a3412;
+  line-height: 1.5;
+}
+
+.submit-failed-close {
+  flex-shrink: 0;
+  background: transparent;
+  border: none;
+  color: #9a3412;
+  font-size: 20px;
+  line-height: 1;
+  padding: 0 4px;
+  cursor: pointer;
+  opacity: 0.7;
+  transition: opacity 0.15s;
+  font-family: inherit;
+}
+
+.submit-failed-close:hover {
+  opacity: 1;
+}
+
 .ac-goal-text {
   font-size: 14px;
   color: var(--color-text-dark);
@@ -1130,9 +1498,9 @@ function handleFollowupClick(question: string) {
   display: flex;
   align-items: flex-end;
   gap: 10px;
-  padding: 8px 8px 8px 16px;
+  padding: 8px;
   border: 1px solid var(--color-primary-border);
-  border-radius: 18px;
+  border-radius: 20px;
   background: #fff;
   box-shadow: 0 2px 8px rgba(16, 42, 67, 0.04);
   transition: border-color 0.15s, box-shadow 0.15s;
@@ -1141,6 +1509,186 @@ function handleFollowupClick(question: string) {
 .composer-inner:focus-within {
   border-color: var(--color-primary);
   box-shadow: 0 2px 12px rgba(123, 63, 178, 0.1);
+}
+
+.plus-btn {
+  flex-shrink: 0;
+  width: 40px;
+  height: 40px;
+  border-radius: 12px;
+  border: 1px solid var(--color-primary-border);
+  background: #fff;
+  color: var(--color-primary);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  transition:
+    background 0.15s ease,
+    border-color 0.15s ease,
+    color 0.15s;
+  font-family: inherit;
+}
+
+.plus-btn:hover,
+.plus-btn.active {
+  background: var(--color-primary-light);
+  border-color: var(--color-primary);
+}
+
+.composer-input-wrap {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  gap: 6px;
+}
+
+.attachment-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.attachment-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 6px 6px 8px;
+  border: 1px solid var(--color-primary-border);
+  border-radius: 10px;
+  background: var(--color-primary-light);
+  max-width: 100%;
+}
+
+.attachment-icon {
+  width: 28px;
+  height: 28px;
+  border-radius: 6px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: #fff;
+  font-size: 13px;
+  font-weight: 700;
+  flex-shrink: 0;
+}
+
+.attachment-icon.word { background: #2b579a; }
+.attachment-icon.pdf { background: #c53030; }
+.attachment-icon.excel { background: #16803d; }
+
+.attachment-meta {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  gap: 1px;
+}
+
+.attachment-name {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--color-text-dark);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 280px;
+}
+
+.attachment-size {
+  font-size: 10px;
+  color: var(--color-text-light);
+}
+
+.attachment-remove {
+  flex-shrink: 0;
+  width: 24px;
+  height: 24px;
+  border: 0;
+  background: transparent;
+  border-radius: 6px;
+  color: var(--color-text-light);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  transition: background 0.12s, color 0.12s;
+  font-family: inherit;
+}
+
+.attachment-remove:hover {
+  background: rgba(220, 53, 69, 0.1);
+  color: #dc3545;
+}
+
+.upload-menu {
+  position: absolute;
+  left: 16px;
+  bottom: calc(100% + 10px);
+  width: 300px;
+  background: #fff;
+  border: 1px solid var(--color-primary-border);
+  border-radius: 14px;
+  box-shadow: 0 12px 32px rgba(16, 42, 67, 0.12);
+  padding: 6px;
+  z-index: 50;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.upload-menu-item {
+  width: 100%;
+  display: inline-flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 12px;
+  border: 0;
+  border-radius: 10px;
+  background: transparent;
+  cursor: pointer;
+  transition: background 0.12s;
+  text-align: left;
+  font-family: inherit;
+}
+
+.upload-menu-item:hover {
+  background: var(--color-primary-light);
+}
+
+.upload-menu-icon {
+  width: 36px;
+  height: 36px;
+  border-radius: 10px;
+  color: #fff;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 16px;
+  font-weight: 700;
+  flex-shrink: 0;
+}
+
+.upload-menu-icon.word { background: #2b579a; }
+.upload-menu-icon.pdf { background: #c53030; }
+.upload-menu-icon.excel { background: #16803d; }
+
+.upload-menu-meta {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  min-width: 0;
+}
+
+.upload-menu-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--color-text-dark);
+}
+
+.upload-menu-desc {
+  font-size: 11px;
+  color: var(--color-text-light);
 }
 
 .composer-input {

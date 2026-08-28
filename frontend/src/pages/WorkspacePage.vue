@@ -1,28 +1,27 @@
 <script setup lang="ts">
 import { computed, onMounted, ref, watch } from 'vue'
-import { useRoute, useRouter } from 'vue-router'
+import { RouterView, useRoute, useRouter } from 'vue-router'
 import { useAuthStore, useConversationStore } from '../stores'
 import type { ConversationSession } from '../types'
 
 const route = useRoute()
 const router = useRouter()
-const auth = useAuthStore()
+const authStore = useAuthStore()
 const conversationStore = useConversationStore()
 
-const LS_KEY = 'report-agent:sidebar-open-v1'
+const SIDEBAR_STATE_KEY = 'report-agent:sidebar-open-v1'
 const showSidebar = ref(true)
 
-const isConversationRoute = computed(
-  () => route.name === 'conversations' || route.name === 'conversation-new' || route.name === 'conversation-detail',
+const userInitial = computed(() =>
+  (authStore.username || 'A').slice(0, 1).toUpperCase(),
 )
-const activeNav = computed(() => {
-  return String(route.meta.nav || route.path.split('/')[1] || '')
-})
+
 const sessions = computed(() => conversationStore.sessions)
 const currentSessionId = computed(() => {
   const id = route.params.sessionId as string | undefined
   return id ?? conversationStore.currentSessionId
 })
+
 const sortedSessions = computed(() => {
   return [...sessions.value].sort((a, b) => {
     const ta = a.updated_at ? new Date(a.updated_at).getTime() : 0
@@ -31,27 +30,78 @@ const sortedSessions = computed(() => {
   })
 })
 
-function go(name: string) {
-  router.push({ name })
+const isConversationRoute = computed(
+  () =>
+    route.name === 'conversations' ||
+    route.name === 'conversation-new' ||
+    route.name === 'conversation-detail',
+)
+
+const activeNav = computed(() => {
+  if (isConversationRoute.value) return 'reports'
+  return String(route.meta.nav || route.path.split('/')[1] || '')
+})
+
+onMounted(async () => {
+  try {
+    const saved = localStorage.getItem(SIDEBAR_STATE_KEY)
+    if (saved === '0') showSidebar.value = false
+  } catch {
+    /* ignore */
+  }
+  try {
+    await conversationStore.ensureSessionListLoaded()
+  } catch {
+    /* ignore — 后端暂无路由时 LS 兜底 */
+  }
+})
+
+watch(showSidebar, (v) => {
+  try {
+    localStorage.setItem(SIDEBAR_STATE_KEY, v ? '1' : '0')
+  } catch {
+    /* ignore */
+  }
+})
+
+async function handleLogout() {
+  authStore.logout()
+  await router.push('/login')
 }
 
-async function handleNewConversation() {
+async function handleNewSession() {
   const s = await conversationStore.createSession('新会话')
   if (s) {
-    await router.push({ name: 'conversation-detail', params: { sessionId: s.id } })
+    await router.push({
+      name: 'conversation-detail',
+      params: { sessionId: s.id },
+    })
   } else {
     await router.push({ name: 'conversation-new' })
   }
 }
 
 function openSession(s: ConversationSession) {
-  router.push({ name: 'conversation-detail', params: { sessionId: s.id } })
+  router.push({
+    name: 'conversation-detail',
+    params: { sessionId: s.id },
+  })
 }
 
-async function handleDeleteSession(sessionId: string, sessionTitle: string) {
-  const ok = window.confirm(`确定删除会话「${sessionTitle || '新会话'}」吗？此操作不可撤销。`)
+function toggleSidebar() {
+  showSidebar.value = !showSidebar.value
+}
+
+async function handleDeleteSession(
+  sessionId: string,
+  sessionTitle: string,
+) {
+  const ok = window.confirm(
+    `确定删除会话「${sessionTitle || '新会话'}」吗？此操作不可撤销。`,
+  )
   if (!ok) return
-  const wasActive = currentSessionId.value === sessionId && isConversationRoute.value
+  const wasActive =
+    currentSessionId.value === sessionId && isConversationRoute.value
   await conversationStore.deleteSession(sessionId)
   if (wasActive) {
     await router.push({ name: 'conversation-new' })
@@ -65,102 +115,83 @@ function formatTime(s: ConversationSession): string {
     const today = new Date()
     const sameDay = d.toDateString() === today.toDateString()
     if (sameDay) {
-      return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`
+      return `${String(d.getHours()).padStart(2, '0')}:${String(
+        d.getMinutes(),
+      ).padStart(2, '0')}`
     }
     return `${d.getMonth() + 1}/${d.getDate()}`
   } catch {
     return ''
   }
 }
-
-function logout() {
-  auth.logout()
-  router.push('/login')
-}
-
-onMounted(async () => {
-  const saved = localStorage.getItem(LS_KEY)
-  if (saved === '0') showSidebar.value = false
-  try {
-    await conversationStore.ensureSessionListLoaded()
-  } catch {
-    /* ignore — 后端暂无路由时 LS 兜底 */
-  }
-})
-
-watch(showSidebar, (v) => {
-  localStorage.setItem(LS_KEY, v ? '1' : '0')
-})
 </script>
 
 <template>
   <div class="workspace">
-    <!-- 顶栏 -->
-    <header class="topbar">
-      <div class="topbar-inner">
-        <div class="topbar-left">
-          <img class="logo" src="/logo.png" alt="光大银行" />
-          <div class="brand">
-            <h1 class="brand-title">智能报告工作台</h1>
-          </div>
+    <!-- 顶栏：严格对齐 ai-report-dev 3 项导航风格 -->
+    <header class="top-bar">
+      <div class="brand-area">
+        <img src="/logo.png" alt="Logo" class="brand-logo" />
+        <span class="brand-divider" aria-hidden="true"></span>
+        <div class="brand-copy">
+          <strong>智能报告工作台</strong>
         </div>
-        <div class="topbar-nav">
-          <button type="button" class="nav-item" :class="{ active: activeNav === 'datasets' }" @click="go('datasets')">
-            数据集
-          </button>
-          <button
-            type="button"
-            class="nav-item"
-            :class="{ active: activeNav === 'tasks' }"
-            @click="go('tasks')"
-            title="任务记录列表接口待后端抵达"
-          >
-            任务记录
-          </button>
-          <button type="button" class="nav-item" :class="{ active: activeNav === 'analysis' }" @click="go('analysis')">
-            分析
-          </button>
-          <button
-            type="button"
-            class="nav-item"
-            :class="{ active: activeNav === 'reports' }"
-            @click="handleNewConversation"
-            title="对话式报告工作台"
-          >
-            报告任务
-          </button>
-          <button
-            type="button"
-            class="nav-item"
-            :class="{ active: activeNav === 'capabilities' }"
-            @click="go('capabilities')"
-            title="能力目录接口待后端抵达"
-          >
-            能力目录
-          </button>
-        </div>
-        <div class="topbar-right">
-          <div class="user-chip">
-            <span class="avatar">{{ auth.username?.[0] || 'A' }}</span>
-            <span class="username">{{ auth.username || 'admin' }}</span>
-          </div>
-          <button type="button" class="logout-btn" @click="logout">退出</button>
-        </div>
+      </div>
+
+      <nav class="primary-nav" aria-label="主导航">
+        <RouterLink
+          :to="{ name: 'conversation-new' }"
+          class="primary-nav-item"
+          :class="{ active: activeNav === 'reports' }"
+          >报告任务</RouterLink
+        >
+        <span
+          class="primary-nav-item disabled"
+          title="历史记录接口尚未开放"
+          >任务记录</span
+        >
+        <span
+          class="primary-nav-item disabled"
+          title="能力目录暂未开放为独立页面"
+          >能力目录</span
+        >
+      </nav>
+
+      <div class="account-area">
+        <span class="avatar" aria-hidden="true">{{ userInitial }}</span>
+        <span class="account-name">{{ authStore.username || '管理员' }}</span>
+        <button
+          class="logout-button"
+          type="button"
+          @click="handleLogout"
+        >退出</button>
       </div>
     </header>
 
     <div class="workspace-body">
-      <!-- 侧边栏 sb-toggle anti-jitter -->
-      <aside v-if="showSidebar" class="sidebar">
+      <!-- 侧栏：单态会话列表，严格截图 -->
+      <aside
+        class="sidebar"
+        aria-label="会话侧边栏"
+        :class="{ collapsed: !showSidebar }"
+      >
         <div class="sidebar-inner">
-          <template v-if="isConversationRoute">
-            <button type="button" class="primary-btn new-session-btn" @click="handleNewConversation">
-              新报告对话
+          <div class="sidebar-section sidebar-top">
+            <button
+              type="button"
+              class="new-session-btn"
+              @click="handleNewSession"
+            >
+              <span>新会话</span>
             </button>
+          </div>
 
-            <div class="section-label">最近会话</div>
+          <div class="sidebar-section">
+            <div class="section-label">最近</div>
             <div class="session-list">
-              <div v-if="sortedSessions.length === 0" class="session-empty">暂无会话，输入第一句话开始</div>
+              <div v-if="sortedSessions.length === 0" class="session-empty">
+                暂无会话
+              </div>
               <div
                 v-for="s in sortedSessions"
                 :key="s.id"
@@ -169,12 +200,14 @@ watch(showSidebar, (v) => {
                 <button
                   type="button"
                   class="session-item"
-                  :class="{ active: currentSessionId === s.id }"
+                  :class="{
+                    active: currentSessionId === s.id && isConversationRoute,
+                  }"
                   @click="openSession(s)"
                   :title="s.title"
                 >
-                  <span class="nav-list-icon nav-list-icon-chat" aria-hidden="true">▤</span>
-                  <span class="nav-list-label">{{ s.title }}</span>
+                  <span class="session-icon" aria-hidden="true">💬</span>
+                  <span class="session-title">{{ s.title }}</span>
                   <span class="session-time">{{ formatTime(s) }}</span>
                 </button>
                 <button
@@ -184,68 +217,61 @@ watch(showSidebar, (v) => {
                   aria-label="删除会话"
                   @click.stop="handleDeleteSession(s.id, s.title)"
                 >
-                  <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                  <svg
+                    viewBox="0 0 24 24"
+                    width="14"
+                    height="14"
+                    fill="none"
+                    stroke="currentColor"
+                    stroke-width="2"
+                    stroke-linecap="round"
+                    stroke-linejoin="round"
+                    aria-hidden="true"
+                  >
                     <polyline points="3 6 5 6 21 6" />
-                    <path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6" />
-                    <path d="M10 11v6" /><path d="M14 11v6" />
-                    <path d="M9 6V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2" />
+                    <path
+                      d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"
+                    />
+                    <path d="M10 11v6" />
+                    <path d="M14 11v6" />
+                    <path
+                      d="M9 6V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2"
+                    />
                   </svg>
                 </button>
               </div>
             </div>
-          </template>
-
-          <template v-else>
-            <button type="button" class="primary-btn new-session-btn" @click="go('datasets')">
-              数据集管理
-            </button>
-
-            <div class="nav-list">
-              <button type="button" class="nav-list-item" :class="{ active: activeNav === 'datasets' }" @click="go('datasets')">
-                <span class="nav-list-label">数据集</span>
-              </button>
-              <button type="button" class="nav-list-item" :class="{ active: activeNav === 'tasks' }" @click="go('tasks')">
-                <span class="nav-list-label">任务记录</span>
-                <span class="nav-badge beta" title="列表接口待后端抵达">占位</span>
-              </button>
-              <button type="button" class="nav-list-item" :class="{ active: activeNav === 'analysis' }" @click="go('analysis')">
-                <span class="nav-list-label">数据分析</span>
-              </button>
-              <button
-                type="button"
-                class="nav-list-item"
-                :class="{ active: activeNav === 'reports' }"
-                @click="handleNewConversation"
-              >
-                <span class="nav-list-label">报告任务</span>
-              </button>
-              <button type="button" class="nav-list-item" :class="{ active: activeNav === 'capabilities' }" @click="go('capabilities')">
-                <span class="nav-list-label">能力目录</span>
-                <span class="nav-badge beta" title="能力目录接口待后端抵达">占位</span>
-              </button>
-            </div>
-          </template>
-
-          <div class="sidebar-spacer" />
+          </div>
         </div>
       </aside>
 
-      <!-- sb-toggle button（固定 anti-jitter） -->
+      <!-- sb-toggle 半胶囊，严格 240/0 切换 -->
       <button
         type="button"
         class="sb-toggle"
-        :class="{ open: showSidebar }"
-        :title="showSidebar ? '收起侧边栏' : '展开侧边栏'"
-        aria-label="toggle sidebar"
-        @click="showSidebar = !showSidebar"
+        :style="{ left: showSidebar ? '240px' : '0px' }"
+        :title="showSidebar ? '收起会话栏' : '展开会话栏'"
+        aria-label="切换会话栏"
+        @click="toggleSidebar"
       >
-        <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round">
-          <polyline v-if="showSidebar" points="15 6 9 12 15 18" />
-          <polyline v-else points="9 6 15 12 9 18" />
+        <svg
+          class="toggle-arrow"
+          :class="{ flip: !showSidebar }"
+          viewBox="0 0 24 24"
+          width="12"
+          height="12"
+          fill="none"
+          stroke="currentColor"
+          stroke-width="2.5"
+          stroke-linecap="round"
+          stroke-linejoin="round"
+          aria-hidden="true"
+        >
+          <path d="M15 18l-6-6 6-6" />
         </svg>
       </button>
 
-      <!-- 主区域：唯一滚动条（或对话页内嵌无外滚动） -->
+      <!-- 主区域：对话页 no-pad（内嵌滚动），其余页面维持 padding -->
       <main class="main-area" :class="{ 'no-pad': isConversationRoute }">
         <RouterView />
       </main>
@@ -256,102 +282,105 @@ watch(showSidebar, (v) => {
 <style scoped>
 .workspace {
   display: flex;
-  flex-direction: column;
   height: 100vh;
+  flex-direction: column;
   overflow: hidden;
-  background: var(--color-bg, #fafafc);
+  background: var(--color-bg-app, #f7f5fb);
 }
 
-/* ── 顶栏 ── */
-.topbar {
-  flex-shrink: 0;
+.workspace-body {
+  flex: 1;
+  display: flex;
+  min-height: 0;
+  overflow: hidden;
+}
+
+/* ── 顶栏 58px：严格 ai-report-dev 截图 ── */
+.top-bar {
   height: 58px;
+  flex-shrink: 0;
   background: #fff;
-  border-bottom: 1px solid var(--color-border, #e9e6ef);
-  z-index: 20;
-}
-
-.topbar-inner {
-  height: 100%;
-  max-width: 100%;
-  padding: 0 24px;
+  border-bottom: 1px solid
+    var(--color-primary-border, rgba(111, 50, 155, 0.14));
   display: flex;
   align-items: center;
+  padding: 0 24px;
   gap: 24px;
 }
 
-.topbar-left {
-  display: flex;
+.brand-area {
+  display: inline-flex;
   align-items: center;
-  gap: 14px;
+  gap: 12px;
+  min-width: 0;
 }
 
-.logo {
+.brand-logo {
   height: 28px;
   width: auto;
   display: block;
 }
 
-.brand-title {
-  font-size: 20px;
-  font-weight: 700;
-  color: var(--color-text-dark, #1a2a43);
-  margin: 0;
-  letter-spacing: 0.5px;
+.brand-divider {
+  width: 1px;
+  height: 22px;
+  background: var(--color-border, #e9e6ef);
 }
 
-.topbar-nav {
-  display: flex;
+.brand-copy {
+  font-size: 18px;
+  color: var(--color-text-dark, #102a43);
+  letter-spacing: 0.3px;
+}
+
+.primary-nav {
+  flex: 1;
+  display: inline-flex;
   align-items: center;
-  gap: 4px;
-  margin-left: auto;
-  margin-right: auto;
+  justify-content: center;
+  gap: 8px;
 }
 
-.nav-item {
-  border: 0;
-  background: transparent;
-  color: var(--color-text-medium, #5a6376);
+.primary-nav-item {
+  display: inline-flex;
+  align-items: center;
+  height: 36px;
+  padding: 0 18px;
+  border-radius: 8px;
   font-size: 14px;
   font-weight: 500;
-  padding: 8px 16px;
-  border-radius: 8px;
+  color: var(--color-text-medium, #486581);
+  text-decoration: none;
+  transition: background 0.15s ease, color 0.15s ease;
   cursor: pointer;
   font-family: inherit;
-  transition: color 0.18s, background 0.18s;
 }
 
-.nav-item:hover:not(.disabled) {
-  color: var(--color-primary);
+.primary-nav-item:hover:not(.disabled) {
   background: var(--color-primary-light);
+  color: var(--color-primary);
 }
 
-.nav-item.active {
-  color: var(--color-primary);
+.primary-nav-item.active {
   background: var(--color-primary-light);
+  color: var(--color-primary);
   font-weight: 600;
 }
 
-.nav-item.disabled {
+.primary-nav-item.disabled {
   color: var(--color-text-light, #9ca3af);
   opacity: 0.55;
   cursor: not-allowed;
 }
 
-.topbar-right {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-}
-
-.user-chip {
+.account-area {
   display: inline-flex;
   align-items: center;
-  gap: 8px;
-  padding: 4px 8px;
+  gap: 10px;
+  flex-shrink: 0;
 }
 
-.user-chip .avatar {
+.account-area .avatar {
   width: 32px;
   height: 32px;
   border-radius: 50%;
@@ -364,13 +393,13 @@ watch(showSidebar, (v) => {
   font-size: 13px;
 }
 
-.user-chip .username {
+.account-name {
   font-size: 13px;
-  font-weight: 500;
   color: var(--color-text-medium);
+  font-weight: 500;
 }
 
-.logout-btn {
+.logout-button {
   border: 1px solid var(--color-border, #e4e1ea);
   background: #fff;
   color: var(--color-text-medium);
@@ -379,30 +408,34 @@ watch(showSidebar, (v) => {
   border-radius: 8px;
   cursor: pointer;
   font-family: inherit;
-  transition: all 0.18s;
+  transition: all 0.15s ease;
 }
 
-.logout-btn:hover {
-  border-color: var(--color-primary-border-strong);
+.logout-button:hover {
+  border-color: var(--color-primary);
   color: var(--color-primary);
 }
 
-/* ── 主体布局 ── */
-.workspace-body {
-  flex: 1;
+/* ── 侧边栏 240px 单态会话列表，严格 ai-report-dev ── */
+.sidebar {
+  width: 240px;
+  flex-shrink: 0;
+  background: var(--color-bg-sidebar, #faf8fc);
+  border-right: 1px solid
+    var(--color-primary-border, rgba(111, 50, 155, 0.14));
   display: flex;
-  min-height: 0;
+  flex-direction: column;
+  overflow: hidden;
+  transition:
+    width 0.24s ease,
+    border-right-width 0.24s ease;
   position: relative;
 }
 
-/* ── 侧边栏 anti-jitter：固定宽度 inner ── */
-.sidebar {
-  flex-shrink: 0;
-  width: 240px;
-  background: #fff;
-  border-right: 1px solid var(--color-border, #e9e6ef);
-  overflow: hidden;
-  position: relative;
+.sidebar.collapsed {
+  width: 0;
+  border-right: 0;
+  padding: 0;
 }
 
 .sidebar-inner {
@@ -415,9 +448,37 @@ watch(showSidebar, (v) => {
   overflow: hidden;
 }
 
+.sidebar-section {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+
+.sidebar-section.sidebar-top {
+  flex-shrink: 0;
+}
+
 .new-session-btn {
   width: 100%;
+  height: 44px;
+  border: 0;
+  border-radius: 12px;
+  background: var(--gradient-primary);
+  color: #fff;
+  font-size: 14px;
+  font-weight: 600;
+  display: inline-flex;
+  align-items: center;
   justify-content: center;
+  cursor: pointer;
+  font-family: inherit;
+  box-shadow: 0 4px 12px rgba(123, 63, 178, 0.22);
+  transition: transform 0.12s ease, box-shadow 0.18s ease;
+}
+
+.new-session-btn:hover {
+  transform: translateY(-1px);
+  box-shadow: 0 6px 16px rgba(123, 63, 178, 0.28);
 }
 
 .section-label {
@@ -468,18 +529,21 @@ watch(showSidebar, (v) => {
   transition: background 0.12s, color 0.12s;
   min-width: 0;
   flex: 1;
+  font-family: inherit;
 }
 
-.session-item::before {
-  content: '';
-  position: absolute;
-  left: -10px;
-  top: 6px;
-  bottom: 6px;
-  width: 3px;
-  border-radius: 0 3px 3px 0;
-  background: transparent;
-  transition: background 0.12s;
+.session-icon {
+  flex-shrink: 0;
+  font-size: 15px;
+  line-height: 1;
+}
+
+.session-title {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .session-item:hover {
@@ -491,14 +555,6 @@ watch(showSidebar, (v) => {
   background: var(--color-bg-active, #efeaf7);
   color: var(--color-primary, #7b3fb2);
   font-weight: 600;
-}
-
-.session-item.active::before {
-  background: var(--color-primary, #7b3fb2);
-}
-
-.nav-list-icon-chat {
-  color: var(--color-primary);
 }
 
 .session-time {
@@ -529,7 +585,10 @@ watch(showSidebar, (v) => {
   color: var(--color-text-light, #9fb3c8);
   cursor: pointer;
   opacity: 0;
-  transition: opacity 0.12s, background 0.12s, color 0.12s;
+  transition:
+    opacity 0.12s,
+    background 0.12s,
+    color 0.12s;
 }
 
 .session-item-wrap:hover .session-delete,
@@ -542,167 +601,58 @@ watch(showSidebar, (v) => {
   color: #dc3545;
 }
 
-.nav-list {
-  display: flex;
-  flex-direction: column;
-  gap: 2px;
-  min-height: 0;
-  overflow: hidden;
-}
-
-.nav-list-item {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  width: 100%;
-  padding: 10px 12px;
-  border: 0;
-  background: transparent;
-  border-radius: 10px;
-  font-size: 14px;
-  color: var(--color-text-medium, #5a6376);
-  cursor: pointer;
-  font-family: inherit;
-  text-align: left;
-  transition: color 0.18s, background 0.18s;
-  position: relative;
-}
-
-.nav-list-item:hover {
-  background: var(--color-bg-hover, #f3f1f8);
-  color: var(--color-text-dark);
-}
-
-.nav-list-item.active {
-  background: var(--color-primary-light);
-  color: var(--color-primary);
-  font-weight: 600;
-}
-
-.nav-list-item.active::before {
-  content: '';
-  position: absolute;
-  left: -12px;
-  top: 6px;
-  bottom: 6px;
-  width: 3px;
-  border-radius: 0 2px 2px 0;
-  background: var(--color-primary);
-}
-
-.nav-list-icon {
-  width: 18px;
-  height: 18px;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  font-size: 14px;
-  line-height: 1;
-}
-
-.nav-list-label {
-  flex: 1;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-
-.nav-badge {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  padding: 2px 7px;
-  border-radius: 6px;
-  font-size: 10.5px;
-  font-weight: 700;
-  letter-spacing: 0.3px;
-  line-height: 1.4;
-  flex-shrink: 0;
-}
-.nav-badge.beta {
-  background: var(--color-bg-gray);
-  color: var(--color-text-medium);
-}
-
-.sidebar-spacer {
-  flex: 1;
-  min-height: 0;
-}
-
-/* ── sb-toggle 半胶囊 ── */
+/* ── sb-toggle 半胶囊：top:74px 严格 ai-report-dev ── */
 .sb-toggle {
   position: absolute;
-  left: 0;
-  top: 80px;
-  width: 16px;
-  height: 32px;
-  border: 1px solid var(--color-border, #e4e1ea);
-  border-left: 0;
-  border-radius: 0 10px 10px 0;
-  background: #fff;
-  color: var(--color-text-medium);
+  top: 74px;
+  z-index: 30;
   display: inline-flex;
   align-items: center;
   justify-content: center;
+  width: 16px;
+  height: 32px;
+  border: 1px solid
+    var(--color-primary-border, rgba(111, 50, 155, 0.14));
+  border-left: 0;
+  border-radius: 0 8px 8px 0;
+  background: #fff;
+  color: var(--color-text-medium, #627d98);
   cursor: pointer;
-  z-index: 15;
-  transition: transform 0.24s ease, left 0.24s ease, color 0.18s, background 0.18s;
-  font-family: inherit;
+  transition:
+    left 0.24s ease,
+    background 0.15s,
+    color 0.15s,
+    border-color 0.15s;
   padding: 0;
-}
-
-.sb-toggle.open {
-  left: 240px;
+  font-family: inherit;
 }
 
 .sb-toggle:hover {
-  color: var(--color-primary);
   background: var(--color-primary-light);
+  color: var(--color-primary);
+  border-color: var(--color-primary-border-strong);
 }
 
-/* ── 主内容区：对话模式下 0 padding 内嵌滚动，其他页面保留 24/28/36 ── */
+.toggle-arrow {
+  transition: transform 0.24s ease;
+}
+
+.toggle-arrow.flip {
+  transform: rotate(180deg);
+}
+
+/* ── 主区域 ── */
 .main-area {
-  height: 100%;
   flex: 1;
   min-width: 0;
-  overflow-y: auto;
+  min-height: 0;
+  overflow: auto;
   padding: 24px 28px 36px;
+  background: var(--color-bg-app, #f7f5fb);
 }
+
 .main-area.no-pad {
   padding: 0;
   overflow: hidden;
-}
-
-/* ── 主按钮 ── */
-.primary-btn {
-  display: inline-flex;
-  align-items: center;
-  gap: 8px;
-  padding: 11px 16px;
-  border-radius: 10px;
-  border: 0;
-  background: var(--gradient-primary);
-  color: #fff;
-  font-size: 14px;
-  font-weight: 600;
-  cursor: pointer;
-  font-family: inherit;
-  box-shadow: 0 2px 6px rgba(123, 63, 178, 0.18);
-  transition: transform 0.12s, box-shadow 0.18s, opacity 0.18s;
-}
-
-.primary-btn:hover:not(:disabled) {
-  transform: translateY(-1px);
-  box-shadow: 0 4px 10px rgba(123, 63, 178, 0.22);
-}
-
-.primary-btn:active:not(:disabled) {
-  transform: translateY(0);
-}
-
-.primary-btn:disabled {
-  opacity: 0.42;
-  cursor: not-allowed;
-  box-shadow: none;
 }
 </style>

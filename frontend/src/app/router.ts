@@ -13,7 +13,7 @@ const router = createRouter({
       path: '/',
       name: 'workspace',
       component: () => import('../pages/WorkspacePage.vue'),
-      redirect: '/datasets',
+      redirect: '/conversations/new',
       meta: { requiresAuth: true },
       children: [
         {
@@ -101,7 +101,7 @@ router.beforeEach(async (to) => {
     return { path: '/login', query: { redirect: to.fullPath } }
   }
   if (to.path === '/login' && auth.isLoggedIn) {
-    return { path: '/datasets' }
+    return { path: '/conversations/new' }
   }
 })
 
