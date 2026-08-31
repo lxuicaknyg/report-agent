@@ -23,6 +23,7 @@ from .reporting import (
 )
 from .config import settings
 from .tools import ListDatasetsTool, ListSheetsTool, ProfileDatasetTool, QueryDatasetTool, ReadDatasetTool
+from .workflows import ExplicitWorkflowRouter, WorkflowIntakeService
 
 
 @lru_cache
@@ -72,4 +73,13 @@ def get_report_generation_service() -> ReportGenerationService:
         renderer=MarkdownReportRenderer(),
         artifact_store=InMemoryArtifactStore(),
         catalog=get_catalog(),
+    )
+
+
+@lru_cache
+def get_workflow_intake_service() -> WorkflowIntakeService:
+    return WorkflowIntakeService(
+        reports=get_report_generation_service(),
+        catalog=get_catalog(),
+        router=ExplicitWorkflowRouter(),
     )

@@ -18,6 +18,7 @@ class Settings:
     api_prefix: str = os.getenv("API_PREFIX", "/api/v1")
     data_dir: Path = Path(os.getenv("DATA_DIR", "./data"))
     artifact_dir: Path = Path(os.getenv("ARTIFACT_DIR", "./artifacts"))
+    log_dir: Path = Path(os.getenv("LOG_DIR", "./logs"))
     database_url: str | None = os.getenv("DATABASE_URL") or None
     llm_base_url: str | None = os.getenv("LLM_BASE_URL") or os.getenv("OPENAI_BASE_URL") or None
     llm_api_key: str | None = os.getenv("LLM_API_KEY") or os.getenv("OPENAI_API_KEY") or None

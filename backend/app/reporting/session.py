@@ -21,6 +21,10 @@ class ReportSessionRepository(ABC):
     async def get(self, session_id: str) -> ReportGenerationSession:
         pass
 
+    @abstractmethod
+    async def list(self) -> list[ReportGenerationSession]:
+        pass
+
 
 class ReportTemplateRepository(ABC):
     @abstractmethod
@@ -31,3 +35,6 @@ class ReportTemplateRepository(ABC):
     async def get(self, template_id: str) -> StoredReportTemplate:
         pass
 
+    @abstractmethod
+    async def list(self) -> list[StoredReportTemplate]:
+        pass

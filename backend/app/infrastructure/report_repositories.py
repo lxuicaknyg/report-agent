@@ -17,6 +17,9 @@ class InMemoryReportSessionRepository(ReportSessionRepository):
         except KeyError as exc:
             raise KeyError(f"Report generation session not found: {session_id}") from exc
 
+    async def list(self) -> list[ReportGenerationSession]:
+        return [session.model_copy(deep=True) for session in self._sessions.values()]
+
 
 class InMemoryReportTemplateRepository(ReportTemplateRepository):
     def __init__(self) -> None:
@@ -35,3 +38,9 @@ class InMemoryReportTemplateRepository(ReportTemplateRepository):
         except KeyError as exc:
             raise KeyError(f"Report template not found: {template_id}") from exc
         return StoredReportTemplate(template=stored.template.model_copy(deep=True), content=bytes(stored.content))
+
+    async def list(self) -> list[StoredReportTemplate]:
+        return [
+            StoredReportTemplate(template=stored.template.model_copy(deep=True), content=bytes(stored.content))
+            for stored in self._templates.values()
+        ]

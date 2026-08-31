@@ -23,6 +23,7 @@ export const useReportStore = defineStore('report', () => {
   const totalSessions = ref(0)
   const sessionsHasMore = ref(false)
   const error = ref<string | null>(null)
+  const pollError = ref<string | null>(null)
 
   let pollTimer: ReturnType<typeof setInterval> | null = null
 
@@ -32,10 +33,13 @@ export const useReportStore = defineStore('report', () => {
       const res = await reportApi.getSession(sessionId)
       if (res.success && res.data) {
         currentSession.value = res.data
+        pollError.value = null
         const st = res.data.status
         if (st === 'completed' || st === 'failed' || st === 'cancelled') {
           stopPolling()
         }
+      } else {
+        pollError.value = res.error?.message || '轮询会话状态失败，请检查网络或刷新页面重试'
       }
     }, POLL_INTERVAL_MS)
   }
@@ -204,6 +208,10 @@ export const useReportStore = defineStore('report', () => {
     error.value = null
   }
 
+  function clearPollError() {
+    pollError.value = null
+  }
+
   function $reset() {
     stopPolling()
     templates.value = []
@@ -218,6 +226,7 @@ export const useReportStore = defineStore('report', () => {
     loadingTemplates.value = false
     loadingSessions.value = false
     error.value = null
+    pollError.value = null
   }
 
   return {
@@ -233,6 +242,7 @@ export const useReportStore = defineStore('report', () => {
     loadingSession,
     loadingSessions,
     error,
+    pollError,
     startPolling,
     stopPolling,
     loadTemplates,
@@ -244,6 +254,7 @@ export const useReportStore = defineStore('report', () => {
     resumeSession,
     addTemplate,
     clearError,
+    clearPollError,
     $reset,
   }
 })

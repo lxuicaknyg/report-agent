@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { ref, computed, nextTick, watch, onMounted, onUnmounted } from 'vue'
-import { useRoute } from 'vue-router'
+import { useRoute, useRouter } from 'vue-router'
 import type { PlanResponse, Task, TaskResult } from '../../types'
 import { useConversationStore } from '../../stores/conversation'
 import StepTimeline from '../plan/StepTimeline.vue'
@@ -8,26 +8,26 @@ import StreamContent from './StreamContent.vue'
 import SlashCommandMenu, { type SlashCommandItem } from './SlashCommandMenu.vue'
 import { useAllTaskStreams } from '../../composables/useAllTaskStreams'
 import { sseClient } from '../../services/events'
-import { taskApi, type SubmitTaskAttachmentRef } from '../../services/api'
+import { taskApi } from '../../services/api'
+import { reportApi } from '../../services/api/reports'
 
-type UploadKind = 'word' | 'pdf' | 'excel'
+type UploadKind = 'word' | 'excel'
 
 type LocalAttachment = {
   file_id: string
   filename: string
   kind: UploadKind
   size: number
+  file: File
 }
 
 const ACCEPT_MAP: Record<UploadKind, string> = {
-  word: '.doc,.docx',
-  pdf: '.pdf',
-  excel: '.xls,.xlsx',
+  word: '.docx,.md,.markdown,.txt',
+  excel: '.xlsx',
 }
 
 const KIND_LABEL: Record<UploadKind, string> = {
-  word: 'Word 文档',
-  pdf: 'PDF 文件',
+  word: '报告模板',
   excel: 'Excel 表格',
 }
 
@@ -57,6 +57,7 @@ const props = defineProps<{
 }>()
 
 const route = useRoute()
+const router = useRouter()
 const conversationStore = useConversationStore()
 
 const inputValue = ref('')
@@ -65,10 +66,13 @@ const inputRef = ref<HTMLTextAreaElement | null>(null)
 const composerRef = ref<HTMLDivElement | null>(null)
 
 const submitFailed = ref(false)
+const submitErrorMessage = ref('')
+const isReportSubmitting = ref(false)
 let submitFailedHideTimer: ReturnType<typeof setTimeout> | null = null
 
-function showSubmitFailedBanner() {
+function showSubmitFailedBanner(message = '提交失败，请稍后重试') {
   submitFailed.value = true
+  submitErrorMessage.value = message
   if (submitFailedHideTimer) clearTimeout(submitFailedHideTimer)
   submitFailedHideTimer = setTimeout(() => {
     submitFailed.value = false
@@ -78,6 +82,7 @@ function showSubmitFailedBanner() {
 
 function dismissSubmitFailed() {
   submitFailed.value = false
+  submitErrorMessage.value = ''
   if (submitFailedHideTimer) {
     clearTimeout(submitFailedHideTimer)
     submitFailedHideTimer = null
@@ -337,11 +342,16 @@ function handleFilesSelected(e: Event) {
   const kind = activeUploadKind.value
   for (let i = 0; i < input.files.length; i += 1) {
     const f = input.files[i]
+    const detectedKind = kind ?? detectKindByFilename(f.name)
+    if (detectedKind !== 'word' && detectedKind !== 'excel') continue
+    const existingIndex = attachments.value.findIndex((a) => a.kind === detectedKind)
+    if (existingIndex >= 0) attachments.value.splice(existingIndex, 1)
     attachments.value.push({
       file_id: `local_${Date.now()}_${i.toString().padStart(3, '0')}`,
       filename: f.name,
-      kind: kind ?? detectKindByFilename(f.name),
+      kind: detectedKind,
       size: f.size,
+      file: f,
     })
   }
   nextTick(() => scrollToBottom())
@@ -349,7 +359,6 @@ function handleFilesSelected(e: Event) {
 
 function detectKindByFilename(name: string): UploadKind {
   const ext = name.toLowerCase()
-  if (ext.endsWith('.pdf')) return 'pdf'
   if (ext.endsWith('.xls') || ext.endsWith('.xlsx')) return 'excel'
   return 'word'
 }
@@ -379,42 +388,29 @@ watch([() => props.tasks], async () => {
 
 async function handleSend() {
   const content = inputValue.value.trim()
-  if ((!content && attachments.value.length === 0) || conversationStore.isSending) return
-
-  if (!conversationStore.currentSessionId) {
-    await conversationStore.createSession('新会话')
-  }
-
-  const sessionIdBefore = conversationStore.currentSessionId
-  const apiAttachments: SubmitTaskAttachmentRef[] = attachments.value.map((a) => ({
-    file_id: a.file_id,
-    filename: a.filename,
-    kind: a.kind,
-  }))
-  const prompt = content
-    ? content
-    : (apiAttachments.length > 0
-      ? `附件：${apiAttachments.map((a) => a.filename).join('、')}`
-      : '')
-  const task = await conversationStore.sendMessage(prompt, { attachments: apiAttachments })
-  attachments.value = []
-  inputValue.value = ''
-  await nextTick(() => autoGrow())
-  scrollToBottom()
-
-  if (sessionIdBefore && conversationStore.currentSessionId === sessionIdBefore) {
-    conversationStore.updateConversationTitle(
-      sessionIdBefore,
-      content || prompt,
-    )
-  }
-
-  if (!task) {
-    showSubmitFailedBanner()
+  if (!content || isReportSubmitting.value) return
+  const templateAttachment = attachments.value.find((a) => a.kind === 'word')
+  const dataAttachment = attachments.value.find((a) => a.kind === 'excel')
+  if (!templateAttachment || !dataAttachment) {
+    showSubmitFailedBanner('请通过“+”同时上传一个报告模板和一个 Excel 文件，再输入生成指令')
     return
   }
 
-  sseClient.connect(task.id)
+  isReportSubmitting.value = true
+  const result = await reportApi.intakeWorkflow(
+    templateAttachment.file,
+    dataAttachment.file,
+    content,
+  )
+  isReportSubmitting.value = false
+  if (!result.success || !result.data?.session?.session_id) {
+    showSubmitFailedBanner(result.error?.message || '报告生成请求提交失败，请检查文件和提示词')
+    return
+  }
+  attachments.value = []
+  inputValue.value = ''
+  await nextTick(() => autoGrow())
+  await router.push({ name: 'report-detail', params: { sessionId: result.data.session.session_id } })
 }
 
 function scrollToBottom() {
@@ -568,7 +564,7 @@ function pickExampleChip(text: string) {
       class="submit-failed-banner"
       role="alert"
     >
-      <span class="submit-failed-text">后端对话服务暂未上线（404），请稍后再试或联系管理员部署接口。</span>
+      <span class="submit-failed-text">{{ submitErrorMessage }}</span>
       <button type="button" class="submit-failed-close" aria-label="关闭提示" @click="dismissSubmitFailed">×</button>
     </div>
     <div ref="messagesContainer" class="chat-scroll">
@@ -728,19 +724,8 @@ function pickExampleChip(text: string) {
         >
           <span class="upload-menu-icon word">W</span>
           <div class="upload-menu-meta">
-            <div class="upload-menu-title">上传 Word 文档</div>
-            <div class="upload-menu-desc">.doc / .docx</div>
-          </div>
-        </button>
-        <button
-          type="button"
-          class="upload-menu-item"
-          @click="openUploadForKind('pdf')"
-        >
-          <span class="upload-menu-icon pdf">P</span>
-          <div class="upload-menu-meta">
-            <div class="upload-menu-title">上传 PDF 文件</div>
-            <div class="upload-menu-desc">.pdf</div>
+            <div class="upload-menu-title">上传报告模板</div>
+            <div class="upload-menu-desc">.docx / .md / .txt</div>
           </div>
         </button>
         <button
@@ -751,7 +736,7 @@ function pickExampleChip(text: string) {
           <span class="upload-menu-icon excel">X</span>
           <div class="upload-menu-meta">
             <div class="upload-menu-title">上传 Excel 表格</div>
-            <div class="upload-menu-desc">.xls / .xlsx</div>
+            <div class="upload-menu-desc">.xlsx</div>
           </div>
         </button>
       </div>
@@ -787,7 +772,7 @@ function pickExampleChip(text: string) {
               class="attachment-chip"
             >
               <span class="attachment-icon" :class="a.kind">
-                {{ a.kind === 'word' ? 'W' : a.kind === 'pdf' ? 'P' : 'X' }}
+                {{ a.kind === 'word' ? 'W' : 'X' }}
               </span>
               <div class="attachment-meta">
                 <span class="attachment-name" :title="a.filename">{{ a.filename }}</span>
@@ -822,10 +807,10 @@ function pickExampleChip(text: string) {
         <button
           class="send-btn"
           @click="handleSend"
-          :disabled="conversationStore.isSending || (!inputValue.trim() && attachments.length === 0)"
+          :disabled="isReportSubmitting || !inputValue.trim()"
         >
-          <span v-if="conversationStore.isSending" class="spinner-small" />
-          <span v-else>发送</span>
+          <span v-if="isReportSubmitting" class="spinner-small" />
+          <span v-else>生成报告</span>
         </button>
       </div>
     </div>

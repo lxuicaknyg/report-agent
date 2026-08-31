@@ -2,12 +2,14 @@
 
 这是一个“报告生成应用”的后端原型。系统的核心目标不是搭建通用 Agent 平台，而是在报告生成业务流程中嵌入模板解析、章节规划、章节写作和文档组装能力。
 
+详细的分层架构、文件职责、运行时依赖关系和新增 Agent 的开发规范，请参阅 [ARCHITECTURE.md](./ARCHITECTURE.md)。
+
 当前后端同时保留两条能力链路：
 
 1. 数据集管理与确定性分析：上传 Excel、注册 SQL 数据源、查看 Schema、执行只读查询。
 2. 报告生成外围流程：上传报告模板、创建报告生成会话、解析模板、生成章节计划、执行章节 Writer、组装报告并生成 Markdown 产物。
 
-当前章节 Writer 使用 `StubChapterWriter`，用于验证外围流程；真实的取数、指标计算、LLM 生成和用户追问逻辑后续再接入。
+当前默认装配的是 `ChapterWriterAgent`，它通过 OpenAI-compatible LLM 完成章节研究和写作；`StubChapterWriter` 仅用于外围流程测试。指标计算、图表生成和更复杂的跨数据源分析仍在后续规划中。
 
 ## 当前实时进度
 
@@ -17,11 +19,11 @@
 - 报告模板可以上传并解析为章节结构，当前支持 DOCX、Markdown 和 TXT。
 - 已建立 `ReportGenerationSession`，支持报告会话创建、章节结果保存、用户问题保存和恢复接口。
 - 已建立 `ReportPlan`、`ChapterWriterInput`、`ChapterWriterResult` 等章节智能体外围契约。
-- 当前章节生成仍使用 `StubChapterWriter`，尚未接入真实 LLM、ReAct 或 LangGraph。
-- `langgraph`、`openai`、`markitdown` 等依赖已经加入运行时依赖清单，但 LangGraph 目前还没有进入业务执行链路。
+- 当前章节生成默认使用 `ChapterWriterAgent`：先进行有界的只读取数循环，再执行无工具写作调用；`StubChapterWriter` 仅用于测试。
+- `openai` 适配器已经进入运行时链路；`langgraph`、`markitdown` 虽已列入依赖，但目前没有进入报告生成主流程。
 - 报告当前只能生成 Markdown 产物，DOCX、PDF 和 HTML 仍属于后续工作。
 - 会话、模板和产物当前使用内存存储，服务重启后会丢失。
-- 当前测试结果为 `7 passed`。
+- 当前测试结果为 `9 passed`（在 `promptenv` 环境中执行）。
 
 ## 一、总体架构
 
@@ -118,13 +120,18 @@ backend/
 │   │       └── sql.py
 │   │
 │   ├── analysis/
-│   │   ├── agent.py
+│   │   ├── __init__.py
+│   │   └── agent.py
+│   │
+│   ├── reporting/
+│   │   ├── __init__.py
 │   │   ├── reports.py
 │   │   ├── report_generation.py
 │   │   ├── session.py
 │   │   ├── template_parser.py
 │   │   ├── planner.py
 │   │   ├── chapter_writer.py
+│   │   ├── chapter_writer_agent.py
 │   │   ├── assembler.py
 │   │   └── renderer.py
 │   │
@@ -229,7 +236,7 @@ POST /api/v1/reports/draft
 - `ChapterDraft`：单个章节的生成结果。
 - `AssembledReport`：组装后的结构化报告。
 - `ReportArtifact`：最终产物的元数据。
-- `UserQuestion`：后续用于记录章节 Writer 的用户追问。
+- `UserQuestion`：记录章节 Writer 在数据不足或需要确认时提出的问题。
 
 这一层定义“报告是什么”和“生成过程处于什么状态”，不负责文件解析、LLM 调用或文档渲染。
 
@@ -377,7 +384,8 @@ OpenAI-compatible LLM 适配器，支持 DashScope 等兼容 OpenAI Chat Complet
 - 报告模板上传和基础结构解析。
 - 报告生成会话和状态流转。
 - 报告计划、章节 Writer 输入/输出模型。
-- Stub 章节 Writer。
+- `ChapterWriterAgent` 的有界只读取数和章节写作流程。
+- Stub 章节 Writer（仅用于外围流程测试）。
 - 报告组装和 Markdown 产物生成。
 - 报告产物下载接口。
 - 旧版 Profile 报告接口兼容。
@@ -431,7 +439,7 @@ pip install --no-index --find-links=./wheels -r requirements.txt
 
 ## 十二、后续推荐迭代顺序
 
-1. 接入真实 `LlmService` 适配器，并保持 `ChapterWriterAgent` 外围接口不变。
+1. 完成真实 LLM 配置、供应商兼容性和端到端链路验证，并保持 `ChapterWriter` 外围接口不变。
 2. 增加指标计算、聚合和图表数据生成能力。
 3. 增强缺失数据追问、会话暂停和恢复策略。
 4. 增加 DOCX 模板样式克隆和 PDF Renderer。

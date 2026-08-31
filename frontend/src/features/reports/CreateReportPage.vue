@@ -116,8 +116,6 @@ async function submit() {
         </div>
       </div>
     </section>
-
-    <div class="todo-chip">P1：等凯旋哥真 SSE endpoint 后替换 2s 轮询</div>
   </div>
 </template>
 
@@ -190,6 +188,4 @@ async function submit() {
 .primary-btn { border: 0; background: var(--gradient-primary); color: #fff; }
 .primary-btn:disabled { opacity: .5; cursor: not-allowed; }
 .secondary-btn { border: 1px solid var(--color-primary-border); background: #fff; color: var(--color-primary); }
-
-.todo-chip { align-self: flex-start; font-size: 12px; color: var(--color-primary); background: var(--color-primary-light); padding: 6px 12px; border-radius: 999px; }
 </style>

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from uuid import uuid4
 
 from ..core.models import utc_now
@@ -21,6 +22,8 @@ from .planner import ReportPlanner
 from .renderer import MarkdownReportRenderer
 from .session import ReportSessionRepository, ReportTemplateRepository, StoredReportTemplate
 from .template_parser import ReportTemplateParser
+
+logger = logging.getLogger(__name__)
 
 
 class ReportGenerationService:
@@ -59,10 +62,21 @@ class ReportGenerationService:
         template_id = f"template_{uuid4().hex}"
         template = self.template_parser.parse(template_id, filename, content, content_type)
         await self.templates.save(StoredReportTemplate(template=template, content=content))
+        logger.info("template_uploaded template_id=%s filename=%s sections=%d", template.template_id, filename, len(template.sections))
         return template
 
     async def get_template(self, template_id: str) -> ReportTemplate:
         return (await self.templates.get(template_id)).template
+
+    async def list_templates(self, offset: int = 0, limit: int = 50) -> tuple[int, list[ReportTemplate]]:
+        items = [stored.template for stored in await self.templates.list()]
+        items.sort(key=lambda item: item.created_at, reverse=True)
+        return len(items), items[offset:offset + limit]
+
+    async def list_sessions(self, offset: int = 0, limit: int = 20) -> tuple[int, list[ReportGenerationSession]]:
+        items = await self.sessions.list()
+        items.sort(key=lambda item: item.updated_at, reverse=True)
+        return len(items), items[offset:offset + limit]
 
     async def create_session(
         self,
@@ -83,6 +97,7 @@ class ReportGenerationService:
             title=request.title,
         )
         await self.sessions.save(session)
+        logger.info("report_session_created session_id=%s template_id=%s datasets=%s", session.session_id, request.template_id, request.dataset_ids)
         if request.auto_start:
             return await self.start(session.session_id)
         return session
@@ -92,6 +107,7 @@ class ReportGenerationService:
 
     async def start(self, session_id: str) -> ReportGenerationSession:
         session = await self.sessions.get(session_id)
+        logger.info("report_generation_started session_id=%s status=%s", session_id, session.status)
         if session.status == ReportGenerationStatus.COMPLETED:
             return session
         if session.status == ReportGenerationStatus.WAITING_USER and session.pending_questions:
@@ -102,6 +118,7 @@ class ReportGenerationService:
         try:
             return await self._continue(session)
         except Exception as exc:
+            logger.exception("report_generation_failed session_id=%s step=%s", session_id, session.current_step)
             session.status = ReportGenerationStatus.FAILED
             session.error = str(exc)
             session.updated_at = utc_now()
@@ -142,6 +159,7 @@ class ReportGenerationService:
 
     async def _continue(self, session: ReportGenerationSession) -> ReportGenerationSession:
         if session.template_snapshot is None:
+            logger.info("template_parsing_started session_id=%s", session.session_id)
             session.current_step = "parse_template"
             stored = await self.templates.get(session.template_id)
             session.template_snapshot = self.template_parser.parse(
@@ -161,6 +179,7 @@ class ReportGenerationService:
                 session.title,
             )
             await self._save(session)
+            logger.info("report_plan_created session_id=%s sections=%d", session.session_id, len(session.plan.sections))
 
         session.status = ReportGenerationStatus.RUNNING
         session.current_step = "write_chapters"
@@ -168,8 +187,10 @@ class ReportGenerationService:
         data_sources = await self._build_data_source_metadata(session.dataset_ids)
         for section in session.plan.sections:
             if section.section_id in session.chapter_drafts:
+                logger.info("chapter_skipped session_id=%s section_id=%s", session.session_id, section.section_id)
                 continue
             session.current_chapter_id = section.section_id
+            logger.info("chapter_generation_started session_id=%s section_id=%s title=%s", session.session_id, section.section_id, section.title)
             writer_input = ChapterWriterInput(
                 section=section,
                 report_outline=[item.title for item in session.plan.sections],
@@ -179,6 +200,7 @@ class ReportGenerationService:
             )
             result = await self.writer.write(writer_input, session)
             if result.status == "waiting_user":
+                logger.info("chapter_waiting_user session_id=%s section_id=%s questions=%d", session.session_id, section.section_id, len(result.questions))
                 session.pending_questions = result.questions
                 session.status = ReportGenerationStatus.WAITING_USER
                 session.current_step = "wait_for_user"
@@ -188,6 +210,7 @@ class ReportGenerationService:
                 raise ValueError(result.error or f"Chapter writer failed: {section.section_id}")
             session.chapter_drafts[section.section_id] = result.draft
             await self._save(session)
+            logger.info("chapter_generation_completed session_id=%s section_id=%s", session.session_id, section.section_id)
 
         session.status = ReportGenerationStatus.RUNNING
         session.current_step = "assemble_report"
@@ -198,6 +221,7 @@ class ReportGenerationService:
             session.chapter_drafts,
         )
         await self._save(session)
+        logger.info("report_assembled session_id=%s chapters=%d", session.session_id, len(session.assembled_report.chapters))
 
         content = await self.renderer.render(session.assembled_report)
         artifact_id = f"artifact_{uuid4().hex}"
@@ -216,6 +240,7 @@ class ReportGenerationService:
         session.current_step = "completed"
         session.error = None
         await self._save(session)
+        logger.info("report_generation_completed session_id=%s artifact_id=%s filename=%s", session.session_id, artifact_id, filename)
         return session
 
     async def _build_data_source_metadata(self, dataset_ids: list[str]) -> list[DataSourceMetadata]:

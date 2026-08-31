@@ -20,7 +20,25 @@ export interface PaginatedSessionsResponse {
   items: ReportGenerationSession[]
 }
 
+export interface WorkflowIntakeResponse {
+  request_id: string
+  intent: string
+  confidence: number
+  status: string
+  session: ReportGenerationSession
+}
+
 export const reportApi = {
+  intakeWorkflow(templateFile: File, dataFile: File, instruction: string, title?: string): Promise<ApiResult<WorkflowIntakeResponse>> {
+    const form = new FormData()
+    form.append('workflow', 'report_generation')
+    form.append('template_file', templateFile)
+    form.append('data_file', dataFile)
+    form.append('instruction', instruction)
+    if (title?.trim()) form.append('title', title.trim())
+    return apiClient.uploadForm<WorkflowIntakeResponse>('/reports/workflows/intake', form)
+  },
+
   listTemplates(offset = 0, limit = 50): Promise<ApiResult<PaginatedTemplatesResponse>> {
     const q = new URLSearchParams({ offset: String(offset), limit: String(limit) })
     return apiClient.get<PaginatedTemplatesResponse>(`/reports/templates?${q.toString()}`)

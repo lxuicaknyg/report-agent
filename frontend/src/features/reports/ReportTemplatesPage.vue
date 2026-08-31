@@ -91,7 +91,7 @@ function levelIndent(level: number | undefined): number {
           <div class="tpl-outline">
             <div class="outline-title">章节结构预览</div>
             <div v-if="!t.sections?.length" class="outline-empty muted">
-              章节 Heading 层级解析待后端 P2 第⑧条接口抵达，当前仅展示总数
+              章节层级解析待后端接口就绪，当前仅展示总数
             </div>
             <ul v-else class="outline-tree">
               <li
@@ -115,7 +115,7 @@ function levelIndent(level: number | undefined): number {
               type="button"
               class="secondary-btn block"
               disabled
-              title="删除模板接口待后端 P1 第④条抵达"
+              title="删除模板功能待后端接口就绪后启用"
             >
               删除模板（待接口）
             </button>

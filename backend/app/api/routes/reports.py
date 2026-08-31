@@ -1,12 +1,47 @@
 from __future__ import annotations
 
-from fastapi import APIRouter, File, HTTPException, Response, UploadFile
+from fastapi import APIRouter, BackgroundTasks, File, Form, HTTPException, Response, UploadFile
 
 from ...core.models import RequestContext
 from ...core.reports import AnswerReportQuestionRequest, CreateReportGenerationRequest
-from ...dependencies import get_agent, get_report_generation_service, get_report_service
+from ...dependencies import get_agent, get_report_generation_service, get_report_service, get_workflow_intake_service
 
 router = APIRouter(prefix="/reports", tags=["reports"])
+
+
+@router.post("/workflows/intake")
+async def intake_report_workflow(
+    background_tasks: BackgroundTasks,
+    template_file: UploadFile = File(...),
+    data_file: UploadFile = File(...),
+    instruction: str = Form(...),
+    title: str | None = Form(None),
+    workflow: str = Form("report_generation"),
+):
+    try:
+        template_name = template_file.filename or "template.txt"
+        data_name = data_file.filename or "data.xlsx"
+        decision, session = await get_workflow_intake_service().intake_report(
+            template_filename=template_name,
+            template_content=await template_file.read(),
+            template_content_type=template_file.content_type,
+            data_filename=data_name,
+            data_content=await data_file.read(),
+            instruction=instruction,
+            title=title,
+            workflow=workflow,
+            user_id=RequestContext().user.id,
+        )
+        background_tasks.add_task(get_report_generation_service().start, session.session_id)
+        return {
+            "request_id": f"request_{session.session_id.removeprefix('report_')}",
+            "intent": decision.workflow.value,
+            "confidence": decision.confidence,
+            "status": "accepted",
+            "session": session,
+        }
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @router.post("/templates")
@@ -19,6 +54,15 @@ async def upload_report_template(file: UploadFile = File(...)):
             content_type=file.content_type,
         )
         return template
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.get("/templates")
+async def list_report_templates(offset: int = 0, limit: int = 50):
+    try:
+        total, items = await get_report_generation_service().list_templates(offset, limit)
+        return {"total": total, "has_more": offset + len(items) < total, "items": items}
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -40,6 +84,15 @@ async def create_report_generation(request: CreateReportGenerationRequest):
         return session
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.get("")
+async def list_report_generations(offset: int = 0, limit: int = 20):
+    try:
+        total, items = await get_report_generation_service().list_sessions(offset, limit)
+        return {"total": total, "has_more": offset + len(items) < total, "items": items}
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 

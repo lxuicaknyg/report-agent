@@ -60,7 +60,7 @@ async function onNlQuery() {
   nlSubmitting.value = true
   nlResult.value = ''
   try {
-    nlResult.value = 'NL→SQL 接口待后端 P1 第⑦条抵达后启用。当前可在「执行 SQL 查询」Tab 中手动输入 SQL。'
+    nlResult.value = 'NL→SQL 功能待后端接口就绪后启用，当前可在「执行 SQL 查询」Tab 中手动输入 SQL。'
   } finally {
     nlSubmitting.value = false
   }
@@ -168,7 +168,7 @@ async function onNlQuery() {
             class="primary-btn"
             :disabled="nlSubmitting || !queryPayload.dataset_id || !nlQuestion.trim()"
             @click="onNlQuery"
-            title="NL→SQL 接口待后端 P1 第⑦条抵达后启用"
+            title="NL→SQL 功能待后端接口就绪后启用"
           >
             {{ nlSubmitting ? '解析中…' : '转成 SQL 并执行（待接口）' }}
           </button>

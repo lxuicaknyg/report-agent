@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from typing import Any
 from uuid import uuid4
 
@@ -15,6 +16,8 @@ from ..core.reports import (
 )
 from ..core.tooling import ToolContext, ToolRegistry, ToolResult
 from .chapter_writer import ChapterWriter
+
+logger = logging.getLogger(__name__)
 
 
 class ChapterWriterAgent(ChapterWriter):
@@ -49,6 +52,7 @@ class ChapterWriterAgent(ChapterWriter):
         input: ChapterWriterInput,
         session: ReportGenerationSession,
     ) -> ChapterWriterResult:
+        logger.info("chapter_agent_started session_id=%s section_id=%s", session.session_id, input.section.section_id)
         research = await self._research_loop(input, session)
         if research["status"] != "ready_for_writing":
             return ChapterWriterResult(
@@ -198,6 +202,7 @@ class ChapterWriterAgent(ChapterWriter):
             {"role": "user", "content": self._json_text(request)},
         ]
         response = await self.llm.complete(messages, [])
+        logger.info("chapter_composition_llm_completed session_id=%s section_id=%s", session.session_id, input.section.section_id)
         payload = self._parse_json(response.get("content", ""))
         if payload.get("status") == "waiting_user":
             return ChapterWriterResult(
