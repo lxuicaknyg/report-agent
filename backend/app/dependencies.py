@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import tempfile
 from functools import lru_cache
+from pathlib import Path
 
 from .analysis.agent import AnalysisAgent
 from .core.tooling import ToolRegistry
@@ -8,7 +10,7 @@ from .data.catalog import DataCatalog
 from .infrastructure.artifact_store import InMemoryArtifactStore
 from .infrastructure.llm import OpenAICompatibleLlmService
 from .infrastructure.report_repositories import (
-    InMemoryReportSessionRepository,
+    PersistentReportSessionRepository,
     InMemoryReportTemplateRepository,
 )
 from .reporting import (
@@ -64,7 +66,7 @@ def get_report_service() -> ReportService:
 @lru_cache
 def get_report_generation_service() -> ReportGenerationService:
     return ReportGenerationService(
-        sessions=InMemoryReportSessionRepository(),
+        sessions=PersistentReportSessionRepository(Path(tempfile.gettempdir()) / "report-agent-sessions.json"),
         templates=InMemoryReportTemplateRepository(),
         template_parser=ReportTemplateParser(),
         planner=ReportPlanner(),
