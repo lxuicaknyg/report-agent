@@ -48,6 +48,8 @@ export interface ExecutionPlan {
   error: string | null
 }
 
+import type { ReportGenerationSession } from './report'
+
 export interface Task {
   id: string
   conversation_id: string
@@ -60,6 +62,8 @@ export interface Task {
   error: string | null
   created_at: string
   updated_at: string
+  /** 报告工作流任务的前端关联状态 */
+  report_session?: ReportGenerationSession | null
 }
 
 export type PlanResponse = ExecutionPlan

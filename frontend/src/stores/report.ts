@@ -38,6 +38,16 @@ export const useReportStore = defineStore('report', () => {
         if (st === 'completed' || st === 'failed' || st === 'cancelled') {
           stopPolling()
         }
+      } else if (
+        res.error?.code === 'REQUEST_FAILED' &&
+        (/404/.test(res.error.message || '') ||
+          /not found|不存在|未找到|session.*not/i.test(res.error.message || ''))
+      ) {
+        // 报告 session 已失效（后端重启后旧内存 ID 丢失、或数据库中确实不存在）
+        // 停止轮询，避免重复刷 404；使用 error banner 通知用户该任务需重新提交。
+        stopPolling()
+        pollError.value = null
+        error.value = '报告任务已失效，请重新提交生成'
       } else {
         pollError.value = res.error?.message || '轮询会话状态失败，请检查网络或刷新页面重试'
       }

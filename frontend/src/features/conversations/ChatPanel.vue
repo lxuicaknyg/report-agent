@@ -1,7 +1,13 @@
 <script setup lang="ts">
 import { ref, computed, nextTick, watch, onMounted, onUnmounted } from 'vue'
-import { useRoute, useRouter } from 'vue-router'
-import type { PlanResponse, Task, TaskResult } from '../../types'
+import { useRoute } from 'vue-router'
+import type {
+  PlanResponse,
+  Task,
+  TaskResult,
+  ReportGenerationSession,
+  ReportTemplateSection,
+} from '../../types'
 import { useConversationStore } from '../../stores/conversation'
 import StepTimeline from '../plan/StepTimeline.vue'
 import StreamContent from './StreamContent.vue'
@@ -10,6 +16,7 @@ import { useAllTaskStreams } from '../../composables/useAllTaskStreams'
 import { sseClient } from '../../services/events'
 import { taskApi } from '../../services/api'
 import { reportApi } from '../../services/api/reports'
+import { renderMarkdown } from '../../utils/markdown'
 
 type UploadKind = 'word' | 'excel'
 
@@ -57,7 +64,6 @@ const props = defineProps<{
 }>()
 
 const route = useRoute()
-const router = useRouter()
 const conversationStore = useConversationStore()
 
 const inputValue = ref('')
@@ -176,6 +182,16 @@ function handleComposerBlur() {
 }
 
 const expandedTasks = ref<Set<string>>(new Set())
+const reportPollers = new Map<string, ReturnType<typeof window.setInterval>>()
+const autoExpandedReportTasks = new Set<string>()
+
+type ReportChapterProgress = {
+  chapter_id: string
+  section_id: string
+  title: string
+  completed: boolean
+  content?: string
+}
 
 const { getStream, handleSSEStreamingEvent, handleSSEStreamingCompleted, handleSSEStreamingFailed, cleanup } = useAllTaskStreams()
 
@@ -238,6 +254,13 @@ onMounted(() => {
   })
 
   nextTick(() => inputRef.value?.focus())
+  for (const task of props.tasks) {
+    if (task.report_session && !['completed', 'failed', 'cancelled'].includes(task.report_session.status)) {
+      autoExpandedReportTasks.add(task.id)
+      expandedTasks.value.add(task.id)
+      startReportPolling(task.id, task.report_session.session_id)
+    }
+  }
 })
 
 watch(() => route.params.sessionId, () => {
@@ -251,7 +274,113 @@ onUnmounted(() => {
   if (unsubscribeStreaming) {
     unsubscribeStreaming()
   }
+  reportPollers.forEach((timer) => window.clearInterval(timer))
+  reportPollers.clear()
 })
+
+function reportStatusText(status?: string): string {
+  const map: Record<string, string> = {
+    created: '已接收', running: '生成中', waiting_user: '等待补充信息', completed: '报告已完成', failed: '生成失败', cancelled: '已取消',
+  }
+  return map[status || ''] || '处理中'
+}
+
+function reportChapters(session?: ReportGenerationSession | null): ReportChapterProgress[] {
+  if (!session) return []
+  const drafts = session.chapter_drafts || {}
+  const sections = session.plan?.sections?.length
+    ? session.plan.sections
+    : (session.template_snapshot?.sections || [])
+  const order = session.plan?.assembly_order?.length
+    ? session.plan.assembly_order
+    : sections.map((section) => section.section_id)
+  const sectionById = new Map<string, ReportTemplateSection>(sections.map((section) => [section.section_id, section]))
+  const ids = [...new Set([...order, ...Object.keys(drafts)])]
+
+  return ids
+    .map((sectionId): ReportChapterProgress => {
+      const draft = drafts[sectionId]
+      const section = sectionById.get(sectionId)
+      return {
+        chapter_id: draft?.chapter_id || `chapter_${sectionId}`,
+        section_id: sectionId,
+        title: draft?.title || section?.title || sectionId,
+        completed: Boolean(draft && draft.completed !== false),
+        content: draft?.content,
+      }
+    })
+    .sort((a, b) => {
+      const orderA = order.indexOf(a.section_id)
+      const orderB = order.indexOf(b.section_id)
+      return (orderA === -1 ? Number.MAX_SAFE_INTEGER : orderA) - (orderB === -1 ? Number.MAX_SAFE_INTEGER : orderB)
+    })
+}
+
+function completedReportChapters(session?: ReportGenerationSession | null): ReportChapterProgress[] {
+  return reportChapters(session).filter((chapter) => chapter.completed && Boolean(chapter.content?.trim()))
+}
+
+function reportProgressLabel(session?: ReportGenerationSession | null): string {
+  const chapters = reportChapters(session)
+  if (chapters.length === 0) return '正在准备章节…'
+  const completed = chapters.filter((chapter) => chapter.completed).length
+  return `章节进度 ${completed}/${chapters.length}`
+}
+
+function startReportPolling(taskId: string, sessionId: string) {
+  if (reportPollers.has(taskId)) return
+  const poll = async () => {
+    const result = await reportApi.getSession(sessionId)
+    if (!result.success || !result.data) {
+      // 报告 session 目前由后端内存仓库存储；后端重启后，刷新页面恢复的旧任务
+      // 会得到 404。此时必须停止轮询，否则每 2 秒会重复刷同一条 404 日志。
+      const isNotFound = result.error?.code === 'REQUEST_FAILED' && (
+        /404/.test(result.error.message) ||
+        /not found|不存在|未找到|session.*not/i.test(result.error.message)
+      )
+      if (isNotFound) {
+        const task = conversationStore.tasks.find((t) => t.id === taskId)
+        if (task) {
+          conversationStore.setTask({
+            ...task,
+            status: 'failed',
+            error: '报告任务已失效，请重新提交生成',
+            report_session: task.report_session ? {
+              ...task.report_session,
+              status: 'failed',
+              error: '后端重启后报告 session 已失效，请重新提交生成',
+            } : task.report_session,
+            updated_at: new Date().toISOString(),
+          })
+        }
+        const timer = reportPollers.get(taskId)
+        if (timer) window.clearInterval(timer)
+        reportPollers.delete(taskId)
+      }
+      return
+    }
+    const session = result.data
+    const task = conversationStore.tasks.find((t) => t.id === taskId)
+    if (!task) return
+    const status = session.status === 'completed' ? 'completed' : session.status === 'failed' ? 'failed' : session.status === 'cancelled' ? 'cancelled' : 'running'
+    const assembled = session.assembled_report
+    conversationStore.setTask({
+      ...task,
+      status,
+      error: session.error || null,
+      report_session: session,
+      result: assembled ? { summary: [assembled.executive_summary, ...(assembled.chapters || []).map((c) => c.content)].filter(Boolean).join('\n\n') } : task.result,
+      updated_at: session.updated_at,
+    })
+    if (['completed', 'failed', 'cancelled'].includes(session.status)) {
+      const timer = reportPollers.get(taskId)
+      if (timer) window.clearInterval(timer)
+      reportPollers.delete(taskId)
+    }
+  }
+  void poll()
+  reportPollers.set(taskId, window.setInterval(poll, 2000))
+}
 
 function toggleCollapse(taskId: string) {
   if (expandedTasks.value.has(taskId)) {
@@ -265,7 +394,10 @@ function isExpanded(taskId: string): boolean {
   return expandedTasks.value.has(taskId)
 }
 
-const currentSessionId = computed(() => conversationStore.currentSessionId)
+// 路由是当前会话的最终来源；初始化阶段 Pinia 可能尚未完成 selectSession。
+const currentSessionId = computed(() =>
+  conversationStore.currentSessionId || String(route.params.sessionId || ''),
+)
 
 const orderedTasks = computed(() =>
   [...props.tasks]
@@ -381,7 +513,28 @@ function currentAcceptStr(): string {
   return [...s].join(',')
 }
 
+async function ensureConversationId(): Promise<string | null> {
+  if (currentSessionId.value) return currentSessionId.value
+  // /conversations/new 在首次渲染时会先显示输入框，初始化会话可能尚未完成。
+  // 提交时主动补齐会话，避免用户遇到“当前会话尚未准备完成”。
+  if (conversationStore.sessions.length > 0) {
+    await conversationStore.selectSession(conversationStore.sessions[0].id)
+  } else {
+    await conversationStore.createSession('新会话')
+  }
+  return currentSessionId.value || conversationStore.currentSessionId || null
+}
+
 watch([() => props.tasks], async () => {
+  for (const task of props.tasks) {
+    if (task.report_session && !['completed', 'failed', 'cancelled'].includes(task.report_session.status)) {
+      if (!autoExpandedReportTasks.has(task.id)) {
+        autoExpandedReportTasks.add(task.id)
+        expandedTasks.value.add(task.id)
+      }
+      startReportPolling(task.id, task.report_session.session_id)
+    }
+  }
   await nextTick()
   scrollToBottom()
 }, { deep: true })
@@ -393,6 +546,11 @@ async function handleSend() {
   const dataAttachment = attachments.value.find((a) => a.kind === 'excel')
   if (!templateAttachment || !dataAttachment) {
     showSubmitFailedBanner('请通过“+”同时上传一个报告模板和一个 Excel 文件，再输入生成指令')
+    return
+  }
+  const conversationId = await ensureConversationId()
+  if (!conversationId) {
+    showSubmitFailedBanner('当前会话尚未准备完成，请稍后重试')
     return
   }
 
@@ -410,7 +568,27 @@ async function handleSend() {
   attachments.value = []
   inputValue.value = ''
   await nextTick(() => autoGrow())
-  await router.push({ name: 'report-detail', params: { sessionId: result.data.session.session_id } })
+  const reportSession = result.data.session
+  const now = new Date().toISOString()
+  const task: Task = {
+    id: reportSession.session_id,
+    conversation_id: conversationId,
+    turn_id: `turn_${reportSession.session_id}`,
+    prompt: content,
+    status: 'running',
+    attachments: [templateAttachment.filename, dataAttachment.filename],
+    plan: null,
+    result: null,
+    error: null,
+    created_at: now,
+    updated_at: now,
+    report_session: reportSession,
+  }
+  conversationStore.setTask(task)
+  startReportPolling(task.id, reportSession.session_id)
+  autoExpandedReportTasks.add(task.id)
+  expandedTasks.value.add(task.id)
+  await nextTick(() => scrollToBottom())
 }
 
 function scrollToBottom() {
@@ -590,14 +768,73 @@ function pickExampleChip(text: string) {
           <div class="msg-row is-user">
             <div class="bubble user-bubble">
               <div class="user-text">{{ task.prompt }}</div>
+              <div v-if="task.attachments?.length" class="message-attachments">
+                <div v-for="file in task.attachments" :key="file" class="message-attachment">
+                  <span class="message-attachment-icon">📎</span>
+                  <span class="message-attachment-name" :title="file">{{ file }}</span>
+                </div>
+              </div>
             </div>
           </div>
 
           <!-- 助手回复 -->
           <div class="msg-row is-assistant">
             <div class="assistant-stack">
+              <div v-if="task.report_session" class="report-progress-card">
+                <button
+                  type="button"
+                  class="thought-head"
+                  :aria-expanded="isExpanded(task.id)"
+                  :aria-controls="`report-progress-${task.id}`"
+                  @click="toggleCollapse(task.id)"
+                >
+                  <span class="ac-bar" aria-hidden="true" />
+                  <span class="ac-title">报告生成过程</span>
+                  <span class="report-progress-count">{{ reportProgressLabel(task.report_session) }}</span>
+                  <span class="thought-badge" :class="task.report_session.status">{{ reportStatusText(task.report_session.status) }}</span>
+                  <svg class="thought-chevron" :class="{ open: isExpanded(task.id) }" viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="6 9 12 15 18 9" /></svg>
+                </button>
+                <div v-if="isExpanded(task.id)" :id="`report-progress-${task.id}`" class="thought-body report-progress-body">
+                  <div class="report-progress-summary">{{ task.report_session.current_step || '正在准备报告内容…' }}</div>
+                  <div v-if="reportChapters(task.report_session).length" class="report-chapter-progress">
+                    <div v-for="chapter in reportChapters(task.report_session)" :key="chapter.chapter_id" class="report-chapter-item">
+                      <span class="report-chapter-dot" :class="{ done: chapter.completed, active: chapter.section_id === task.report_session.current_chapter_id && !chapter.completed }">{{ chapter.completed ? '✓' : '·' }}</span>
+                      <div class="report-chapter-main">
+                        <div class="report-chapter-title">{{ chapter.title }}</div>
+                        <div class="report-chapter-state">
+                          {{ chapter.completed ? '章节已完成' : chapter.section_id === task.report_session.current_chapter_id ? '正在生成…' : '等待生成' }}
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                  <div v-else class="report-chapter-empty">正在解析模板并创建章节计划…</div>
+                </div>
+              </div>
+
+              <div v-if="completedReportChapters(task.report_session).length" class="report-chapter-results">
+                <div v-for="chapter in completedReportChapters(task.report_session)" :key="`${task.id}-${chapter.chapter_id}`" class="answer-bubble report-chapter-answer">
+                  <div class="report-final-label">章节生成完成</div>
+                  <article class="report-inline md-content">
+                    <h3>{{ chapter.title }}</h3>
+                    <div v-html="renderMarkdown(chapter.content || '')" />
+                  </article>
+                </div>
+              </div>
+
+              <div v-if="task.report_session?.status === 'completed' && task.report_session.assembled_report" class="answer-bubble report-answer-bubble">
+                <div class="report-final-label">报告生成完成</div>
+                <article class="report-inline md-content">
+                  <h2>{{ task.report_session.assembled_report.title }}</h2>
+                  <div v-if="task.report_session.assembled_report.executive_summary" class="report-inline-summary" v-html="renderMarkdown(task.report_session.assembled_report.executive_summary)" />
+                  <section v-for="chapter in task.report_session.assembled_report.chapters || []" :key="chapter.chapter_id" class="report-inline-section">
+                    <h3>{{ chapter.title }}</h3>
+                    <div v-html="renderMarkdown(chapter.content || '')" />
+                  </section>
+                </article>
+              </div>
+
               <div
-                v-if="task.plan || task.status === 'created' || task.status === 'planning' || task.status === 'running'"
+                v-if="!task.report_session && (task.plan || task.status === 'created' || task.status === 'planning' || task.status === 'running')"
                 class="thought-card"
               >
                 <button type="button" class="thought-head" @click="toggleCollapse(task.id)">
@@ -635,9 +872,11 @@ function pickExampleChip(text: string) {
               <!-- 回答气泡（流式中 + 已完成回答 + 中止内容都走这里，无大标题，直接正文） -->
               <div
                 v-if="
-                  (task.status === 'running' && getStream(task.id).chunks.length > 0) ||
-                  (task.status === 'completed' && (hasResultData(task.result as TaskResult) || getStream(task.id).chunks.length > 0)) ||
-                  (task.status === 'cancelled' && getStream(task.id).chunks.length > 0)
+                  !task.report_session && (
+                    (task.status === 'running' && getStream(task.id).chunks.length > 0) ||
+                    (task.status === 'completed' && (hasResultData(task.result as TaskResult) || getStream(task.id).chunks.length > 0)) ||
+                    (task.status === 'cancelled' && getStream(task.id).chunks.length > 0)
+                  )
                 "
                 class="answer-bubble"
               >
@@ -677,7 +916,7 @@ function pickExampleChip(text: string) {
               </div>
 
               <!-- 完成无结果 -->
-              <div v-if="task.status === 'completed' && !hasResultData(task.result as TaskResult) && getStream(task.id).chunks.length === 0" class="answer-bubble answer-empty">
+              <div v-if="!task.report_session && task.status === 'completed' && !hasResultData(task.result as TaskResult) && getStream(task.id).chunks.length === 0" class="answer-bubble answer-empty">
                 <div class="ac-result-text">任务已完成</div>
               </div>
 
@@ -932,6 +1171,28 @@ function pickExampleChip(text: string) {
   white-space: pre-wrap;
 }
 
+.message-attachments {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 10px;
+  padding-top: 9px;
+  border-top: 1px solid rgba(255,255,255,.28);
+}
+
+.message-attachment {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  max-width: 220px;
+  padding: 5px 8px;
+  border-radius: 8px;
+  background: rgba(255,255,255,.16);
+  font-size: 12px;
+}
+
+.message-attachment-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
 /* ── 助手卡片堆叠 ── */
 .assistant-stack {
   width: 100%;
@@ -990,7 +1251,8 @@ function pickExampleChip(text: string) {
 .thought-badge.planning,
 .thought-badge.running,
 .thought-badge.created,
-.thought-badge.needs_data {
+.thought-badge.needs_data,
+.thought-badge.waiting_user {
   color: var(--color-primary);
   background: var(--color-primary-light);
 }
@@ -1032,6 +1294,29 @@ function pickExampleChip(text: string) {
 .thought-body .ac-goal {
   margin-top: 12px;
 }
+
+.report-progress-card { width: 100%; }
+.report-progress-body { padding: 14px 16px 16px; }
+.report-progress-summary { color: var(--color-text-medium); font-size: 13px; margin-bottom: 12px; }
+.report-progress-count { flex-shrink: 0; color: var(--color-text-light); font-size: 12px; white-space: nowrap; }
+.report-chapter-progress { display: flex; flex-direction: column; gap: 10px; }
+.report-chapter-item { display: flex; gap: 10px; align-items: flex-start; }
+.report-chapter-dot { width: 22px; height: 22px; border-radius: 50%; background: var(--color-bg-gray); color: var(--color-text-light); display: inline-flex; align-items: center; justify-content: center; flex-shrink: 0; font-weight: 700; }
+.report-chapter-dot.done { background: var(--color-success-bg); color: var(--color-success); }
+.report-chapter-dot.active { background: var(--color-primary-light); color: var(--color-primary); animation: pulse 1.6s infinite; }
+.report-chapter-main { min-width: 0; flex: 1; }
+.report-chapter-title { font-size: 13px; font-weight: 600; color: var(--color-text-dark); }
+.report-chapter-state { margin-top: 3px; font-size: 12px; color: var(--color-text-light); }
+.report-chapter-empty { color: var(--color-text-light); font-size: 12px; padding: 6px 0 2px; }
+.report-chapter-results { display: flex; flex-direction: column; gap: 12px; }
+.report-chapter-answer { border-color: var(--color-primary-border); }
+.report-answer-bubble { border-color: rgba(47,138,86,.28); }
+.report-final-label { color: var(--color-success); font-weight: 700; font-size: 13px; }
+.report-inline h2 { margin: 0 0 12px; font-size: 20px; color: var(--color-text-dark); }
+.report-inline h3 { margin: 0 0 10px; font-size: 16px; color: var(--color-text-dark); }
+.report-inline-summary { padding: 11px 13px; border-radius: 8px; background: #fff9ef; border-left: 3px solid #f5c76a; margin-bottom: 16px; }
+.report-inline-section { margin-top: 16px; }
+.report-inline-section h3 { margin: 0 0 7px; font-size: 16px; color: var(--color-text-dark); }
 
 /* ── 回答气泡 ── */
 .answer-bubble {

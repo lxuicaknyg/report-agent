@@ -60,6 +60,23 @@ function persistTasks(tasks: Task[]) {
   }
 }
 
+function createLocalSessionRecord(title?: string): ConversationSession {
+  const now = new Date().toISOString()
+  return {
+    id: `local_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`,
+    title: title?.trim() || '新会话',
+    created_at: now,
+    updated_at: now,
+  }
+}
+
+function isConversationEndpointUnavailable(result: { success: boolean; error?: { code?: string; message?: string } }): boolean {
+  if (result.success) return false
+  const message = result.error?.message || ''
+  const code = result.error?.code || ''
+  return code === 'NOT_FOUND' || /404|not found|不存在|未找到/i.test(message)
+}
+
 export const useConversationStore = defineStore('conversation', () => {
   const sessions = ref<ConversationSession[]>(loadSessionsFromLS())
   const currentSessionId = ref<string | null>(null)
@@ -98,6 +115,15 @@ export const useConversationStore = defineStore('conversation', () => {
         currentSessionId.value = result.data.id
         currentTaskId.value = null
         return result.data
+      }
+      // 当前后端尚未提供 conversations CRUD；报告任务的会话关系可以先由前端本地维护。
+      if (isConversationEndpointUnavailable(result)) {
+        const localSession = createLocalSessionRecord(title)
+        sessions.value.unshift(localSession)
+        persistSessions(sessions.value)
+        currentSessionId.value = localSession.id
+        currentTaskId.value = null
+        return localSession
       }
       return null
     } finally {
@@ -141,6 +167,8 @@ export const useConversationStore = defineStore('conversation', () => {
     currentSessionId.value = sessionId
     isLoading.value = true
     try {
+      // 本地兜底会话没有对应的后端资源，直接使用本地缓存即可。
+      if (sessionId.startsWith('local_')) return
       const result = await conversationApi.getSession(sessionId)
       if (result.success && result.data) {
         const serverSession = result.data
