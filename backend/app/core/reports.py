@@ -11,6 +11,7 @@ from .models import Evidence, utc_now
 
 class ReportGenerationStatus(str, Enum):
     CREATED = "created"
+    AWAITING_CONFIRMATION = "awaiting_confirmation"
     RUNNING = "running"
     WAITING_USER = "waiting_user"
     COMPLETED = "completed"
@@ -42,14 +43,39 @@ class ReportTemplate(BaseModel):
     created_at: datetime = Field(default_factory=utc_now)
 
 
+class ReportGlobalContext(BaseModel):
+    report_period: str | None = None
+    dimensions: dict[str, str] = Field(default_factory=dict)
+
+
+class ChapterPlan(BaseModel):
+    section_id: str
+    title: str
+    metrics: list[str] = Field(default_factory=list)
+
+
 class ReportPlan(BaseModel):
     plan_id: str
+    version: int = 1
+    status: Literal[
+        "generated",
+        "awaiting_confirmation",
+        "approved",
+        "executing",
+        "completed",
+    ] = "generated"
     template_id: str
     title: str
     instruction: str
-    sections: list[ReportTemplateSection] = Field(default_factory=list)
+    global_context: ReportGlobalContext = Field(default_factory=ReportGlobalContext)
+    chapters: list[ChapterPlan] = Field(default_factory=list)
     assembly_order: list[str] = Field(default_factory=list)
     created_at: datetime = Field(default_factory=utc_now)
+
+    @property
+    def sections(self) -> list[ChapterPlan]:
+        """Compatibility view for callers that used the old field name."""
+        return self.chapters
 
 
 class DataSourceMetadata(BaseModel):
@@ -59,11 +85,15 @@ class DataSourceMetadata(BaseModel):
     description: str | None = None
     sheets: list[dict[str, Any]] = Field(default_factory=list)
     columns: list[dict[str, Any]] = Field(default_factory=list)
+    sample_rows: list[dict[str, Any]] = Field(default_factory=list)
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 
 class ChapterWriterInput(BaseModel):
     section: ReportTemplateSection
+    chapter_plan: ChapterPlan | None = None
+    global_context: ReportGlobalContext = Field(default_factory=ReportGlobalContext)
+    metrics: list[str] = Field(default_factory=list)
     report_outline: list[str] = Field(default_factory=list)
     data_sources: list[DataSourceMetadata] = Field(default_factory=list)
     user_instruction: str = ""
@@ -129,6 +159,7 @@ class ReportGenerationSession(BaseModel):
     current_step: str | None = None
     current_chapter_id: str | None = None
     template_snapshot: ReportTemplate | None = None
+    data_source_metadata: list[DataSourceMetadata] = Field(default_factory=list)
     plan: ReportPlan | None = None
     chapter_drafts: dict[str, ChapterDraft] = Field(default_factory=dict)
     pending_questions: list[UserQuestion] = Field(default_factory=list)
@@ -145,7 +176,17 @@ class CreateReportGenerationRequest(BaseModel):
     dataset_ids: list[str] = Field(min_length=1)
     instruction: str = Field(min_length=1)
     title: str | None = None
-    auto_start: bool = True
+    auto_start: bool = False
+
+
+class ConfirmReportPlanRequest(BaseModel):
+    """User-editable fields of a generated report plan."""
+
+    title: str | None = None
+    report_period: str | None = None
+    dimensions: dict[str, str] | None = None
+    global_context: ReportGlobalContext | None = None
+    chapters: list[ChapterPlan] | None = None
 
 
 class AnswerReportQuestionRequest(BaseModel):

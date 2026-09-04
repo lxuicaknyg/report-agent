@@ -69,7 +69,7 @@ def get_report_generation_service() -> ReportGenerationService:
         sessions=PersistentReportSessionRepository(Path(tempfile.gettempdir()) / "report-agent-sessions.json"),
         templates=InMemoryReportTemplateRepository(),
         template_parser=ReportTemplateParser(),
-        planner=ReportPlanner(),
+        planner=ReportPlanner(llm=get_llm()),
         writer=ChapterWriterAgent(llm=get_llm(), tools=get_registry()),
         assembler=ReportAssembler(),
         renderer=MarkdownReportRenderer(),

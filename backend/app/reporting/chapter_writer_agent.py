@@ -192,6 +192,9 @@ class ChapterWriterAgent(ChapterWriter):
     ) -> ChapterWriterResult:
         request = {
             "chapter": input.section.model_dump(),
+            "chapter_plan": input.chapter_plan.model_dump() if input.chapter_plan else None,
+            "global_context": input.global_context.model_dump(),
+            "metrics": input.metrics,
             "report_outline": input.report_outline,
             "user_instruction": input.user_instruction,
             "previous_answers": input.previous_answers,
@@ -345,6 +348,7 @@ class ChapterWriterAgent(ChapterWriter):
         return (
             "你是报告章节取数智能体。只能执行只读数据读取，不做聚合或复杂计算。"
             "Excel/CSV 使用 read_dataset，SQL 使用 query_dataset。可以多次读取。"
+            "报告计划中的指标和全局维度是业务目标，不是底层字段名；必须先查看元数据再定位数据。"
             "工具报错时根据错误修正参数；无法确定时返回 waiting_user。"
             "数据足够后返回 JSON：{\"status\":\"ready_for_writing\"}。"
         )
@@ -353,7 +357,8 @@ class ChapterWriterAgent(ChapterWriter):
     def _composition_system_prompt() -> str:
         return (
             "你是报告章节写作智能体。请严格参考 chapter.template_text 和 template_blocks 的结构，"
-            "只使用 collected_data 中真实存在的数据，不编造事实，不调用工具，不做复杂计算。"
+            "围绕 chapter_plan.metrics 和 global_context 组织内容，只使用 collected_data 中真实存在的数据，"
+            "不编造事实，不调用工具，不做复杂计算。"
             "返回 JSON：status、content、tables、charts、assumptions、questions。"
         )
 
@@ -361,6 +366,9 @@ class ChapterWriterAgent(ChapterWriter):
     def _research_request(input: ChapterWriterInput) -> dict[str, Any]:
         return {
             "chapter": input.section.model_dump(),
+            "chapter_plan": input.chapter_plan.model_dump() if input.chapter_plan else None,
+            "global_context": input.global_context.model_dump(),
+            "metrics": input.metrics,
             "report_outline": input.report_outline,
             "data_sources": [source.model_dump() for source in input.data_sources],
             "user_instruction": input.user_instruction,

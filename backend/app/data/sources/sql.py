@@ -23,14 +23,33 @@ class SqlDataSource(RegisteredDataSource):
 
     @property
     def datasets(self) -> list[DatasetInfo]:
-        return [DatasetInfo(dataset_id=self.dataset_id, name=self.table_name, source_type="sql", source_name=self.table_name, description=self.description)]
+        return [
+            DatasetInfo(
+                dataset_id=self.dataset_id,
+                name=self.table_name,
+                source_type="sql",
+                source_name=self.table_name,
+                description=self.description,
+                columns=self._schema(),
+            )
+        ]
 
     async def get_schema(self, dataset_id: str, sheet_name: str | None = None) -> list[ColumnSchema]:
         if sheet_name:
             raise ValueError("SQL data sources do not have sheets")
         self._check_dataset(dataset_id)
+        return self._schema()
+
+    def _schema(self) -> list[ColumnSchema]:
         inspector = inspect(self.engine)
-        return [ColumnSchema(name=item["name"], data_type=str(item["type"]), nullable=bool(item.get("nullable", True))) for item in inspector.get_columns(self.table_name)]
+        return [
+            ColumnSchema(
+                name=item["name"],
+                data_type=str(item["type"]),
+                nullable=bool(item.get("nullable", True)),
+            )
+            for item in inspector.get_columns(self.table_name)
+        ]
 
     async def profile(self, dataset_id: str) -> DatasetProfile:
         self._check_dataset(dataset_id)

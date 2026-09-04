@@ -166,12 +166,19 @@ class ReportGenerationService:
         session.current_step = "write_chapters"
         await self._save(session)
         data_sources = await self._build_data_source_metadata(session.dataset_ids)
+        template_sections = {section.section_id: section for section in session.template_snapshot.sections}
         for section in session.plan.sections:
             if section.section_id in session.chapter_drafts:
                 continue
             session.current_chapter_id = section.section_id
+            template_section = template_sections.get(section.section_id)
+            if template_section is None:
+                raise ValueError(f"Template section not found: {section.section_id}")
             writer_input = ChapterWriterInput(
-                section=section,
+                section=template_section.model_copy(update={"title": section.title}),
+                chapter_plan=section,
+                global_context=session.plan.global_context,
+                metrics=section.metrics,
                 report_outline=[item.title for item in session.plan.sections],
                 data_sources=data_sources,
                 user_instruction=session.instruction,

@@ -1,4 +1,5 @@
 import asyncio
+import json
 
 from app.reporting.assembler import ReportAssembler
 from app.reporting.chapter_writer import StubChapterWriter
@@ -11,9 +12,17 @@ from app.core.reports import (
     AnswerReportQuestionRequest,
     ChapterDraft,
     ChapterWriterResult,
+    ConfirmReportPlanRequest,
     CreateReportGenerationRequest,
     ReportGenerationStatus,
     UserQuestion,
+)
+from app.core.ports import LlmService
+from app.core.reports import (
+    ChapterPlan,
+    DataSourceMetadata,
+    ReportTemplate,
+    ReportTemplateSection,
 )
 from app.data.catalog import DataCatalog
 from app.infrastructure.artifact_store import InMemoryArtifactStore
@@ -35,6 +44,109 @@ def build_service() -> ReportGenerationService:
         artifact_store=InMemoryArtifactStore(),
         catalog=DataCatalog(),
     )
+
+
+def test_planner_keeps_business_plan_separate_from_data_access_metadata():
+    async def run():
+        template = ReportTemplate(
+            template_id="template_plan",
+            filename="plan.md",
+            title="经营分析",
+            sections=[
+                ReportTemplateSection(
+                    section_id="section_1",
+                    title="贷款业务情况",
+                    order=0,
+                    required_data=["授信贷款余额", "对公贷款余额"],
+                )
+            ],
+        )
+        metadata = [
+            DataSourceMetadata(
+                dataset_id="excel_1",
+                name="经营数据",
+                source_type="excel",
+                sheets=[{"sheet_name": "Sheet1", "columns": [{"name": "贷款余额"}]}],
+                columns=[{"name": "贷款余额"}],
+            )
+        ]
+        plan = await ReportPlanner().create_plan(
+            template,
+            metadata,
+            "报告期间：2025年第四季度，机构：北京分行",
+        )
+        assert plan.global_context.report_period == "2025年第四季度"
+        assert plan.global_context.dimensions == {"机构": "北京分行"}
+        assert plan.chapters == [ChapterPlan(section_id="section_1", title="贷款业务情况", metrics=["授信贷款余额", "对公贷款余额"])]
+        assert "excel_1" not in plan.model_dump_json()
+        assert "Sheet1" not in plan.model_dump_json()
+
+    asyncio.run(run())
+
+
+def test_planner_uses_model_to_infer_metrics_from_template_and_metadata():
+    class PlannerLlm(LlmService):
+        def __init__(self):
+            self.messages = []
+
+        async def complete(self, messages, tools):
+            self.messages.append(messages)
+            return {
+                "content": json.dumps(
+                    {
+                        "title": "北京分行经营分析报告",
+                        "global_context": {
+                            "report_period": "2025年第四季度",
+                            "dimensions": {"机构": "北京分行"},
+                        },
+                        "chapters": [
+                            {
+                                "section_id": "section_1",
+                                "title": "贷款业务情况",
+                                "metrics": ["授信贷款余额", "对公贷款余额"],
+                            }
+                        ],
+                    },
+                    ensure_ascii=False,
+                ),
+                "tool_calls": [],
+            }
+
+    async def run():
+        llm = PlannerLlm()
+        template = ReportTemplate(
+            template_id="template_model",
+            filename="历史报告.md",
+            title="历史报告",
+            sections=[
+                ReportTemplateSection(
+                    section_id="section_1",
+                    title="贷款业务情况",
+                    order=0,
+                    template_text="本季度贷款余额较上季度有所变化。",
+                )
+            ],
+        )
+        plan = await ReportPlanner(llm=llm).create_plan(
+            template,
+            [
+                DataSourceMetadata(
+                    dataset_id="excel_1",
+                    name="经营数据",
+                    source_type="excel",
+                    columns=[{"name": "期末余额"}],
+                    sample_rows=[{"期末余额": 100}],
+                )
+            ],
+            "请生成北京分行2025年第四季度报告",
+        )
+        prompt = llm.messages[0][1]["content"]
+        assert "历史报告.md" in prompt
+        assert "期末余额" in prompt
+        assert plan.chapters[0].metrics == ["授信贷款余额", "对公贷款余额"]
+        assert plan.global_context.report_period == "2025年第四季度"
+
+    asyncio.run(run())
 
 
 def test_report_generation_outer_flow_and_artifact():
@@ -64,6 +176,7 @@ def test_report_generation_outer_flow_and_artifact():
                 template_id=template.template_id,
                 dataset_ids=["excel_001"],
                 instruction="参考模板生成类似报告",
+                auto_start=True,
             ),
             user_id="local-user",
         )
@@ -146,6 +259,14 @@ def test_chapter_writer_can_pause_for_user_and_resume():
         session = await service.create_session(
             CreateReportGenerationRequest(template_id=template.template_id, dataset_ids=["excel_002"], instruction="generate"),
             user_id="local-user",
+        )
+        assert session.status == ReportGenerationStatus.AWAITING_CONFIRMATION
+        assert session.plan is not None
+        assert session.data_source_metadata[0].sheets[0]["columns"][0]["name"] == "value"
+
+        session = await service.confirm_plan(
+            session.session_id,
+            ConfirmReportPlanRequest(chapters=session.plan.chapters),
         )
         assert session.status == ReportGenerationStatus.WAITING_USER
         assert session.pending_questions[0].question_id == "q-1"

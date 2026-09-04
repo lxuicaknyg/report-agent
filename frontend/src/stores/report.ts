@@ -23,7 +23,6 @@ export const useReportStore = defineStore('report', () => {
   const totalSessions = ref(0)
   const sessionsHasMore = ref(false)
   const error = ref<string | null>(null)
-  const pollError = ref<string | null>(null)
 
   let pollTimer: ReturnType<typeof setInterval> | null = null
 
@@ -33,23 +32,17 @@ export const useReportStore = defineStore('report', () => {
       const res = await reportApi.getSession(sessionId)
       if (res.success && res.data) {
         currentSession.value = res.data
-        pollError.value = null
         const st = res.data.status
         if (st === 'completed' || st === 'failed' || st === 'cancelled') {
           stopPolling()
         }
-      } else if (
-        res.error?.code === 'REQUEST_FAILED' &&
-        (/404/.test(res.error.message || '') ||
-          /not found|不存在|未找到|session.*not/i.test(res.error.message || ''))
-      ) {
-        // 报告 session 已失效（后端重启后旧内存 ID 丢失、或数据库中确实不存在）
-        // 停止轮询，避免重复刷 404；使用 error banner 通知用户该任务需重新提交。
+      } else if (res.error?.code === 'REQUEST_FAILED' && (
+        /404/.test(res.error.message) ||
+        /not found|不存在|未找到|session.*not/i.test(res.error.message)
+      )) {
+        // 后端使用内存 session 时，重启会使旧 session 失效；停止轮询，避免持续刷 404。
         stopPolling()
-        pollError.value = null
         error.value = '报告任务已失效，请重新提交生成'
-      } else {
-        pollError.value = res.error?.message || '轮询会话状态失败，请检查网络或刷新页面重试'
       }
     }, POLL_INTERVAL_MS)
   }
@@ -218,10 +211,6 @@ export const useReportStore = defineStore('report', () => {
     error.value = null
   }
 
-  function clearPollError() {
-    pollError.value = null
-  }
-
   function $reset() {
     stopPolling()
     templates.value = []
@@ -236,7 +225,6 @@ export const useReportStore = defineStore('report', () => {
     loadingTemplates.value = false
     loadingSessions.value = false
     error.value = null
-    pollError.value = null
   }
 
   return {
@@ -252,7 +240,6 @@ export const useReportStore = defineStore('report', () => {
     loadingSession,
     loadingSessions,
     error,
-    pollError,
     startPolling,
     stopPolling,
     loadTemplates,
@@ -264,8 +251,6 @@ export const useReportStore = defineStore('report', () => {
     resumeSession,
     addTemplate,
     clearError,
-    clearPollError,
     $reset,
   }
 })
-

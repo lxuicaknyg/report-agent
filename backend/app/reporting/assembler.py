@@ -17,5 +17,5 @@ class ReportAssembler:
             executive_summary=f"本报告参考模板“{template.filename}”生成，共包含 {len(chapters)} 个章节。",
             chapters=chapters,
             evidence=evidence,
-            metadata={"template_id": template.template_id, "plan_id": plan.plan_id},
+            metadata={"template_id": template.template_id, "plan_id": plan.plan_id, "plan_version": plan.version},
         )

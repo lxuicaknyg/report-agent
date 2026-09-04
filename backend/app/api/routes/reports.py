@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-from fastapi import APIRouter, BackgroundTasks, File, Form, HTTPException, Response, UploadFile
+from fastapi import APIRouter, File, Form, HTTPException, Response, UploadFile
 
 from ...core.models import RequestContext
-from ...core.reports import AnswerReportQuestionRequest, CreateReportGenerationRequest
+from ...core.reports import AnswerReportQuestionRequest, ConfirmReportPlanRequest, CreateReportGenerationRequest
 from ...dependencies import get_agent, get_report_generation_service, get_report_service, get_workflow_intake_service
 
 router = APIRouter(prefix="/reports", tags=["reports"])
@@ -11,7 +11,6 @@ router = APIRouter(prefix="/reports", tags=["reports"])
 
 @router.post("/workflows/intake")
 async def intake_report_workflow(
-    background_tasks: BackgroundTasks,
     template_file: UploadFile = File(...),
     data_file: UploadFile = File(...),
     instruction: str = Form(...),
@@ -32,7 +31,6 @@ async def intake_report_workflow(
             workflow=workflow,
             user_id=RequestContext().user.id,
         )
-        background_tasks.add_task(get_report_generation_service().start, session.session_id)
         return {
             "request_id": f"request_{session.session_id.removeprefix('report_')}",
             "intent": decision.workflow.value,
@@ -109,6 +107,16 @@ async def get_report_generation(session_id: str):
 async def answer_report_question(session_id: str, request: AnswerReportQuestionRequest):
     try:
         return await get_report_generation_service().answer_question(session_id, request)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post("/{session_id}/plan/confirm")
+async def confirm_report_plan(session_id: str, request: ConfirmReportPlanRequest):
+    try:
+        return await get_report_generation_service().confirm_plan(session_id, request)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except Exception as exc:
