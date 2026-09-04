@@ -5,6 +5,7 @@ import type {
   ReportGenerationSession,
   CreateReportGenerationRequest,
   AnswerReportQuestionRequest,
+  ConfirmReportPlanRequest,
   LegacyProfileReportResponse,
 } from '../../types'
 
@@ -74,6 +75,13 @@ export const reportApi = {
 
   resumeSession(sessionId: string): Promise<ApiResult<ReportGenerationSession>> {
     return apiClient.post<ReportGenerationSession>(`/reports/${sessionId}/resume`, {})
+  },
+
+   confirmPlan(
+    sessionId: string,
+    request: ConfirmReportPlanRequest,
+  ): Promise<ApiResult<ReportGenerationSession>> {
+    return apiClient.post<ReportGenerationSession>(`/reports/${sessionId}/plan/confirm`, request)
   },
 
   downloadArtifact(sessionId: string, artifactId: string): Promise<ApiResult<Blob>> {

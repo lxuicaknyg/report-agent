@@ -1,8 +1,16 @@
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, ref } from 'vue'
+import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import { useRoute } from 'vue-router'
 import { useReportStore } from '../../stores/report'
-import type { AnswerReportQuestionRequest, ChapterDraft, UserQuestion, ReportArtifact } from '../../types'
+import type {
+  AnswerReportQuestionRequest,
+  ChapterDraft,
+  ChapterPlan,
+  ReportPlan,
+  UserQuestion,
+  ReportArtifact,
+  ConfirmReportPlanRequest,
+} from '../../types'
 import { reportApi } from '../../services/api/reports'
 import { renderMarkdown } from '../../utils/markdown'
 import { downloadBlob, suggestFilename } from '../../utils/download'
@@ -13,19 +21,16 @@ const store = useReportStore()
 const sessionId = computed(() => String(route.params.sessionId || ''))
 
 const answerPayload = ref<Record<string, string>>({})
-const answeringQuestionId = ref<string | null>(null)
-const reportCollapsed = ref(false)
-
-function toggleReport() {
-  reportCollapsed.value = !reportCollapsed.value
-}
-
-const assembledChapterCount = computed(() =>
-  store.currentSession?.assembled_report?.chapters?.length ?? 0,
-)
+const planTitle = ref('')
+const planPeriod = ref('')
+const planDimensions = ref<Record<string, string>>({})
+const planChapters = ref<ChapterPlan[]>([])
+const newDimensionKey = ref('')
+const newDimensionValue = ref('')
 
 const statusTextMap: Record<string, { label: string; cls: string }> = {
   created:      { label: '已创建', cls: 'status-created' },
+  awaiting_confirmation: { label: '待确认计划', cls: 'status-waiting' },
   running:      { label: '执行中', cls: 'status-running' },
   waiting_user: { label: '等待补充信息', cls: 'status-waiting' },
   completed:    { label: '已完成', cls: 'status-completed' },
@@ -39,6 +44,7 @@ const statusBadge = computed(() => {
 })
 
 const isCompleted = computed(() => store.currentSession?.status === 'completed')
+const awaitingPlanConfirmation = computed(() => store.currentSession?.plan?.status === 'awaiting_confirmation')
 const reportTitleForExport = computed(() => {
   return store.currentSession?.title
     || store.currentSession?.template_snapshot?.title
@@ -58,17 +64,57 @@ const chapters = computed<ChapterDraft[]>(() => {
 async function submitAnswer(q: UserQuestion) {
   const ans = (answerPayload.value[q.question_id] || '').trim()
   if (!ans) return
-  answeringQuestionId.value = q.question_id
-  try {
-    const req: AnswerReportQuestionRequest = {
-      question_id: q.question_id,
-      answer: ans,
-      auto_resume: true,
-    }
-    await store.answerQuestion(sessionId.value, req)
-  } finally {
-    answeringQuestionId.value = null
+  const req: AnswerReportQuestionRequest = {
+    question_id: q.question_id,
+    answer: ans,
+    auto_resume: true,
   }
+  await store.answerQuestion(sessionId.value, req)
+}
+
+function syncPlanEditor(plan: ReportPlan | null | undefined) {
+  if (!plan) return
+  planTitle.value = plan.title
+  planPeriod.value = plan.global_context?.report_period || ''
+  planDimensions.value = { ...(plan.global_context?.dimensions || {}) }
+  planChapters.value = (plan.chapters || plan.sections || []).map((chapter) => ({
+    section_id: chapter.section_id,
+    title: chapter.title,
+    metrics: [...chapter.metrics],
+  }))
+}
+
+function updateMetrics(chapter: ChapterPlan, event: Event) {
+  const value = (event.target as HTMLInputElement).value
+  chapter.metrics = value.split('、').map((item) => item.trim()).filter(Boolean)
+}
+
+function addDimension() {
+  const key = newDimensionKey.value.trim()
+  const value = newDimensionValue.value.trim()
+  if (!key || !value) return
+  planDimensions.value[key] = value
+  newDimensionKey.value = ''
+  newDimensionValue.value = ''
+}
+
+function removeDimension(key: string) {
+  delete planDimensions.value[key]
+}
+
+async function confirmPlan() {
+  if (!store.currentSession?.plan) return
+  const request: ConfirmReportPlanRequest = {
+    title: planTitle.value.trim() || null,
+    report_period: planPeriod.value.trim() || null,
+    dimensions: { ...planDimensions.value },
+    chapters: planChapters.value.map((chapter) => ({
+      section_id: chapter.section_id,
+      title: chapter.title.trim() || chapter.section_id,
+      metrics: chapter.metrics.map((metric) => metric.trim()).filter(Boolean),
+    })),
+  }
+  await store.confirmPlan(sessionId.value, request)
 }
 
 async function downloadArtifact(a: ReportArtifact) {
@@ -81,28 +127,14 @@ async function downloadArtifact(a: ReportArtifact) {
 }
 
 function exportDisabledHint(format: 'pdf' | 'docx'): string {
-  return `导出 ${format.toUpperCase()} 功能待后端接口就绪后启用`
-}
-
-const chaptersCollapsed = ref(true)
-
-function toggleChapters() {
-  chaptersCollapsed.value = !chaptersCollapsed.value
-}
-
-const expandedChapterIds = ref<Set<string>>(new Set())
-
-function toggleExpand(chapterId: string) {
-  if (expandedChapterIds.value.has(chapterId)) {
-    expandedChapterIds.value.delete(chapterId)
-  } else {
-    expandedChapterIds.value.add(chapterId)
-  }
+  return `导出 ${format.toUpperCase()} 文件接口（水印导字节流）待后端 P2 第⑩条抵达后启用`
 }
 
 onMounted(() => {
   void store.reloadSession(sessionId.value)
 })
+
+watch(() => store.currentSession?.plan, syncPlanEditor, { immediate: true })
 
 onUnmounted(() => {
   store.stopPolling()
@@ -122,14 +154,55 @@ onUnmounted(() => {
       </div>
     </header>
 
-    <div v-if="store.error" class="error-banner page-banner">
-      <span>{{ store.error }}</span>
-      <button type="button" class="banner-close" @click="store.clearError()" aria-label="关闭">×</button>
-    </div>
-    <div v-if="store.pollError" class="warn-banner page-banner">
-      <span>{{ store.pollError }}</span>
-      <button type="button" class="banner-close" @click="store.clearPollError()" aria-label="关闭">×</button>
-    </div>
+    <section v-if="awaitingPlanConfirmation && store.currentSession?.plan" class="card plan-card">
+      <div class="plan-head">
+        <div>
+          <h3 class="card-title">确认报告计划</h3>
+          <p class="plan-desc">确认后将按章节动态查找数据并生成正文；计划不会展示或锁定具体 Sheet、字段或 SQL。</p>
+        </div>
+        <span class="plan-version">v{{ store.currentSession.plan.version }}</span>
+      </div>
+
+      <div class="plan-form">
+        <label class="form-label">报告标题</label>
+        <input v-model="planTitle" class="text-input" />
+
+        <label class="form-label">报告期间</label>
+        <input v-model="planPeriod" class="text-input" placeholder="例如：2025 年第四季度" />
+
+        <label class="form-label">全局维度</label>
+        <div v-if="Object.keys(planDimensions).length" class="dimension-list">
+          <div v-for="(value, key) in planDimensions" :key="key" class="dimension-row">
+            <input v-model="planDimensions[key]" class="text-input" :aria-label="`${key}值`" />
+            <span class="dimension-key">{{ key }}</span>
+            <button type="button" class="remove-btn" @click="removeDimension(key)">移除</button>
+          </div>
+        </div>
+        <div class="dimension-add">
+          <input v-model="newDimensionKey" class="text-input" placeholder="维度名，如机构" />
+          <input v-model="newDimensionValue" class="text-input" placeholder="维度值，如北京分行" />
+          <button type="button" class="secondary-btn" @click="addDimension">添加</button>
+        </div>
+
+        <label class="form-label">章节与指标</label>
+        <div class="plan-chapters">
+          <div v-for="chapter in planChapters" :key="chapter.section_id" class="plan-chapter">
+            <input v-model="chapter.title" class="text-input chapter-edit-title" />
+            <input
+              :value="chapter.metrics.join('、')"
+              class="text-input"
+              placeholder="指标，用顿号分隔"
+              @input="updateMetrics(chapter, $event)"
+            />
+          </div>
+        </div>
+        <div class="plan-actions">
+          <button type="button" class="primary-btn" :disabled="store.loadingSession" @click="confirmPlan">
+            {{ store.loadingSession ? '确认中…' : '确认计划并开始生成' }}
+          </button>
+        </div>
+      </div>
+    </section>
 
     <section v-if="store.currentSession?.status === 'waiting_user' && store.currentSession.pending_questions?.length" class="card waiting-card">
       <h3 class="card-title warn">需要你补充以下信息（共 {{ store.currentSession.pending_questions.length }} 条）</h3>
@@ -144,16 +217,16 @@ onUnmounted(() => {
             rows="3"
             class="text-input"
             placeholder="请输入你的回答…"
-            :disabled="!!q.answer || answeringQuestionId === q.question_id"
+            :disabled="!!q.answer"
           />
           <div v-if="!q.answer" class="q-actions">
             <button
               type="button"
               class="primary-btn"
-              :disabled="!(answerPayload[q.question_id] || '').trim() || answeringQuestionId !== null"
+              :disabled="!(answerPayload[q.question_id] || '').trim() || store.loadingSession"
               @click="submitAnswer(q)"
             >
-              {{ answeringQuestionId === q.question_id ? '提交中…' : '提交并继续' }}
+              提交并继续
             </button>
           </div>
           <div v-else class="q-answer">
@@ -164,108 +237,68 @@ onUnmounted(() => {
     </section>
 
     <section class="card">
-      <div class="card-head-row">
-        <h3 class="card-title">章节进度（{{ chapters.filter(c => c.completed).length }} / {{ chapters.length || store.currentSession?.plan?.sections?.length || 0 }}）</h3>
-        <button
-          type="button"
-          class="toggle-expand-btn"
-          @click="toggleChapters()"
-        >
-          {{ chaptersCollapsed ? '展开章节' : '收起章节' }}
-        </button>
+      <h3 class="card-title">章节进度（{{ chapters.filter(c => c.completed).length }} / {{ chapters.length || store.currentSession?.plan?.chapters?.length || store.currentSession?.plan?.sections?.length || 0 }}）</h3>
+      <div v-if="store.loadingSession" class="hint">加载中…</div>
+      <div v-else-if="chapters.length === 0" class="hint small">
+        章节 Writer 使用 Stub 占位，若后端未进入 running 状态可观察 current_step 变化：
+        <span class="mono">{{ store.currentSession?.current_step || '—' }}</span>
       </div>
-      <template v-if="!chaptersCollapsed">
-        <div v-if="store.loadingSession" class="hint">加载中…</div>
-        <div v-else-if="chapters.length === 0" class="hint small">
-          章节 Writer 使用 Stub 占位，若后端未进入 running 状态可观察 current_step 变化：
-          <span class="mono">{{ store.currentSession?.current_step || '—' }}</span>
-        </div>
-        <ul v-else class="chapter-list">
-          <li v-for="c in chapters" :key="c.chapter_id" class="chapter-row">
-            <div class="chapter-status" :class="c.completed ? 'done' : 'run'">{{ c.completed ? '完成' : '执行中' }}</div>
-            <div class="chapter-body">
-              <div class="chapter-head-row">
-                <div class="chapter-title">{{ c.title }}</div>
-                <button
-                  v-if="c.content && c.content.length > 200"
-                  type="button"
-                  class="toggle-expand-btn"
-                  @click="toggleExpand(c.chapter_id)"
-                >
-                  {{ expandedChapterIds.has(c.chapter_id) ? '收起预览' : '查看全文' }}
-                </button>
-              </div>
-              <div
-                v-if="c.content"
-                class="chapter-preview md-content"
-                v-html="renderMarkdown(expandedChapterIds.has(c.chapter_id) ? c.content : (c.content.length > 200 ? c.content.slice(0, 200) + '…' : c.content))"
-              />
-              <div v-if="c.questions?.length" class="chapter-qcount">本章节追问 {{ c.questions.filter((q: UserQuestion) => !q.answer).length }} 条待答</div>
-            </div>
-          </li>
-        </ul>
-      </template>
-      <div v-else class="collapsed-hint">
-        共 {{ chapters.length || store.currentSession?.plan?.sections?.length || 0 }} 章，已完成 {{ chapters.filter(c => c.completed).length }} 章。点击右上角「展开章节」查看详情
-      </div>
+      <ul v-else class="chapter-list">
+        <li v-for="c in chapters" :key="c.chapter_id" class="chapter-row">
+          <div class="chapter-status" :class="c.completed ? 'done' : 'run'">{{ c.completed ? '完成' : '执行中' }}</div>
+          <div class="chapter-body">
+            <div class="chapter-title">{{ c.title }}</div>
+            <div
+              v-if="c.content"
+              class="chapter-preview md-content"
+              v-html="renderMarkdown(c.content.length > 200 ? c.content.slice(0, 200) + '…' : c.content)"
+            />
+            <div v-if="c.questions?.length" class="chapter-qcount">本章节追问 {{ c.questions.filter((q: UserQuestion) => !q.answer).length }} 条待答</div>
+          </div>
+        </li>
+      </ul>
     </section>
 
     <section v-if="store.currentSession?.assembled_report" class="card">
-      <div class="card-head-row">
-        <h3 class="card-title">组装报告</h3>
-        <div class="report-head-actions">
-          <div class="export-row">
-            <button
-              type="button"
-              class="secondary-btn"
-              disabled
-              :title="exportDisabledHint('pdf')"
-            >
-              导出 PDF
-            </button>
-            <button
-              type="button"
-              class="secondary-btn"
-              disabled
-              :title="exportDisabledHint('docx')"
-            >
-              导出 Word
-            </button>
-            <span v-if="!isCompleted" class="muted small">
-              仅在「已完成」状态且接口上线后可导出
-            </span>
-            <span v-else class="muted small">{{ suggestFilename(reportTitleForExport, 'pdf') }}</span>
-          </div>
+      <div class="report-head-row">
+        <h3 class="card-title" style="margin:0">组装报告</h3>
+        <div class="export-row">
           <button
             type="button"
-            class="toggle-expand-btn"
-            @click="toggleReport()"
+            class="secondary-btn"
+            disabled
+            :title="exportDisabledHint('pdf')"
           >
-            {{ reportCollapsed ? '展开报告' : '收起报告' }}
+            导出 PDF
           </button>
+          <button
+            type="button"
+            class="secondary-btn"
+            disabled
+            :title="exportDisabledHint('docx')"
+          >
+            导出 Word
+          </button>
+          <span v-if="!isCompleted" class="muted small">
+            仅在「已完成」状态且接口上线后可导出
+          </span>
+          <span v-else class="muted small">{{ suggestFilename(reportTitleForExport, 'pdf') }}</span>
         </div>
       </div>
-      <template v-if="!reportCollapsed">
-        <article class="report-preview md-content">
-          <h1 class="report-head">{{ store.currentSession.assembled_report.title }}</h1>
-          <section v-if="store.currentSession.assembled_report.executive_summary" class="report-section summary">
-            <h2 class="summary-h">摘要</h2>
-            <div
-              class="summary-text"
-              v-html="renderMarkdown(store.currentSession.assembled_report.executive_summary)"
-            />
-          </section>
-          <section v-for="c in store.currentSession.assembled_report.chapters" :key="c.chapter_id" class="report-section">
-            <h2 class="chapter-h">{{ c.title }}</h2>
-            <div class="chapter-md" v-html="renderMarkdown(c.content)" />
-          </section>
-        </article>
-      </template>
-      <div v-else class="collapsed-hint">
-        共 {{ assembledChapterCount }} 章，
-        <span v-if="store.currentSession.assembled_report.executive_summary">含摘要，</span>
-        点击右上角「展开报告」查看全文
-      </div>
+      <article class="report-preview md-content">
+        <h1 class="report-head">{{ store.currentSession.assembled_report.title }}</h1>
+        <section v-if="store.currentSession.assembled_report.executive_summary" class="report-section summary">
+          <h2 class="summary-h">摘要</h2>
+          <div
+            class="summary-text"
+            v-html="renderMarkdown(store.currentSession.assembled_report.executive_summary)"
+          />
+        </section>
+        <section v-for="c in store.currentSession.assembled_report.chapters" :key="c.chapter_id" class="report-section">
+          <h2 class="chapter-h">{{ c.title }}</h2>
+          <div class="chapter-md" v-html="renderMarkdown(c.content)" />
+        </section>
+      </article>
     </section>
 
     <section v-if="store.currentSession?.artifacts?.length" class="card">
@@ -283,6 +316,10 @@ onUnmounted(() => {
         </li>
       </ul>
     </section>
+
+    <div class="todo-chip" title="真 SSE 路由 GET /reports/:id/stream 待后端 P0 第①条抵达后替换 startPolling 3 行">
+      P2：真 SSE endpoint 抵达后替换 2s 轮询
+    </div>
   </div>
 </template>
 
@@ -291,55 +328,13 @@ onUnmounted(() => {
 
 .crumbs { font-size: 12px; color: var(--color-text-light); margin-bottom: 6px; font-family: 'JetBrains Mono', Consolas, monospace; }
 
-.page-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; flex-wrap: wrap; margin-bottom: 4px; }
-
-.page-banner {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-  padding: 10px 14px;
-  border-radius: 10px;
-  font-size: 13px;
-}
-.error-banner {
-  background: #fde8e8;
-  border: 1px solid #f5b7b7;
-  color: #b91c1c;
-}
-.warn-banner {
-  background: #fff6e6;
-  border: 1px solid #f5c76a;
-  color: #8a5a00;
-}
-.banner-close {
-  flex-shrink: 0;
-  width: 20px;
-  height: 20px;
-  border-radius: 4px;
-  border: 0;
-  background: transparent;
-  color: inherit;
-  opacity: 0.7;
-  font-size: 16px;
-  line-height: 1;
-  cursor: pointer;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-}
-.banner-close:hover { opacity: 1; background: rgba(0,0,0,0.05); }
-
-.card-head-row { display: flex; align-items: center; justify-content: space-between; gap: 14px; margin-bottom: 14px; flex-wrap: wrap; }
-.report-head-actions { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.page-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; flex-wrap: wrap; }
+.report-head-row { display: flex; align-items: center; justify-content: space-between; gap: 14px; margin-bottom: 14px; flex-wrap: wrap; }
 .export-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 .page-title { font-size: 22px; font-weight: 700; margin: 0 0 4px; color: var(--color-text-dark); }
 .page-desc { font-size: 13px; color: var(--color-text-medium); margin: 0; max-width: 70ch; }
 
 .head-right { display: flex; align-items: center; }
-
-.muted { color: var(--color-text-medium); }
-.small { font-size: 12px; }
 
 .status-chip {
   display: inline-flex; align-items: center;
@@ -355,15 +350,8 @@ onUnmounted(() => {
 @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: .65; } }
 
 .card { background: #fff; border: 1px solid var(--color-border, #eae7f0); border-radius: 14px; padding: 18px 20px; }
-.card-title { font-size: 15px; font-weight: 600; margin: 0; color: var(--color-text-dark); }
+.card-title { font-size: 15px; font-weight: 600; margin: 0 0 14px; color: var(--color-text-dark); }
 .card-title.warn { color: #c77a00; }
-.collapsed-hint {
-  padding: 10px 14px;
-  background: #fbfaff;
-  border-radius: 8px;
-  font-size: 13px;
-  color: var(--color-text-medium);
-}
 
 .hint { padding: 24px; text-align: center; color: var(--color-text-medium); font-size: 13.5px; }
 .hint.small { padding: 16px; font-size: 13px; text-align: left; background: #fbfaff; border-radius: 10px; }
@@ -371,6 +359,22 @@ onUnmounted(() => {
 .mono { font-family: 'JetBrains Mono', Consolas, monospace; font-size: 12.5px; padding: 2px 6px; background: #f5f3fa; border-radius: 4px; color: #4b3f66; }
 
 .waiting-card { border-color: #f5c76a; background: #fffbf0; }
+
+.plan-card { border-color: var(--color-primary-border); background: #fcfbff; }
+.plan-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
+.plan-desc { margin: -8px 0 14px; color: var(--color-text-medium); font-size: 12.5px; }
+.plan-version { color: var(--color-primary); background: var(--color-primary-light); border-radius: 999px; padding: 4px 9px; font-size: 12px; }
+.plan-form { display: flex; flex-direction: column; gap: 8px; }
+.dimension-list, .plan-chapters { display: flex; flex-direction: column; gap: 8px; }
+.dimension-row { display: flex; align-items: center; gap: 8px; }
+.dimension-row .text-input { flex: 1; }
+.dimension-key { min-width: 44px; color: var(--color-text-medium); font-size: 12px; order: -1; }
+.dimension-add { display: flex; gap: 8px; }
+.dimension-add .text-input { flex: 1; }
+.plan-chapter { display: flex; flex-direction: column; gap: 6px; padding: 10px 12px; border: 1px solid var(--color-primary-border); border-radius: 9px; background: #fff; }
+.chapter-edit-title { font-weight: 600; }
+.remove-btn { border: 0; background: transparent; color: #b45309; cursor: pointer; font-size: 12px; }
+.plan-actions { display: flex; justify-content: flex-end; margin-top: 6px; }
 
 .q-list { display: flex; flex-direction: column; gap: 14px; }
 .q-item { background: #fff; border: 1px solid var(--color-primary-border); border-radius: 10px; padding: 12px 14px; display: flex; flex-direction: column; gap: 10px; }
@@ -395,21 +399,7 @@ onUnmounted(() => {
 .chapter-status.done { background: #e6f6ec; color: #157a42; }
 .chapter-status.run { background: var(--color-primary-light); color: var(--color-primary); }
 .chapter-body { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 4px; }
-.chapter-head-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
 .chapter-title { font-size: 14px; font-weight: 600; color: var(--color-text-dark); }
-.toggle-expand-btn {
-  flex-shrink: 0;
-  padding: 3px 10px;
-  border: 1px solid var(--color-primary-border);
-  background: #fff;
-  color: var(--color-primary);
-  border-radius: 6px;
-  font-size: 12px;
-  font-weight: 500;
-  cursor: pointer;
-  font-family: inherit;
-}
-.toggle-expand-btn:hover { background: var(--color-primary-light); }
 .chapter-preview {
   margin: 2px 0 0; padding: 10px 12px; background: #f7f5fc; border-radius: 8px;
   font-size: 12.5px; line-height: 1.65; color: #4b3f66;
@@ -480,4 +470,6 @@ onUnmounted(() => {
 .primary-btn:disabled { opacity: .5; cursor: not-allowed; }
 .secondary-btn { border: 1px solid var(--color-primary-border); background: #fff; color: var(--color-primary); }
 .secondary-btn:hover { background: var(--color-primary-light); }
+
+.todo-chip { align-self: flex-start; font-size: 12px; color: var(--color-primary); background: var(--color-primary-light); padding: 6px 12px; border-radius: 999px; }
 </style>

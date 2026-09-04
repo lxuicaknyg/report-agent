@@ -15,7 +15,7 @@ const payload = ref<CreateReportGenerationRequest>({
   dataset_ids: [],
   instruction: '',
   title: '',
-  auto_start: true,
+  auto_start: false,
 })
 
 onMounted(() => {
@@ -104,10 +104,7 @@ async function submit() {
         <input v-model="payload.title" class="text-input" placeholder="例如：2025Q1 资产负债分析报告" />
         <label class="form-label">指令（必填）：</label>
         <textarea v-model="payload.instruction" rows="5" class="text-input" placeholder="例如：请根据模板章节结构，以 2024 年年报口径撰写，附上同比说明" />
-        <label class="form-check">
-          <input type="checkbox" v-model="payload.auto_start" />
-          <span>创建后立即开始（Stub ChapterWriter 占位模式，完成/失败状态会 2s 自动拉取）</span>
-        </label>
+        <div class="hint small">创建后会先生成报告计划，确认计划后才开始章节取数和正文生成。</div>
         <div class="actions">
           <button type="button" class="secondary-btn" @click="$router.back()">返回</button>
           <button type="button" class="primary-btn" :disabled="!canSubmit || reportStore.loadingSession" @click="submit">
@@ -116,6 +113,8 @@ async function submit() {
         </div>
       </div>
     </section>
+
+    <div class="todo-chip">P1：等凯旋哥真 SSE endpoint 后替换 2s 轮询</div>
   </div>
 </template>
 
@@ -188,4 +187,6 @@ async function submit() {
 .primary-btn { border: 0; background: var(--gradient-primary); color: #fff; }
 .primary-btn:disabled { opacity: .5; cursor: not-allowed; }
 .secondary-btn { border: 1px solid var(--color-primary-border); background: #fff; color: var(--color-primary); }
+
+.todo-chip { align-self: flex-start; font-size: 12px; color: var(--color-primary); background: var(--color-primary-light); padding: 6px 12px; border-radius: 999px; }
 </style>

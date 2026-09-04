@@ -1,12 +1,14 @@
 <script setup lang="ts">
 import { ref, computed, nextTick, watch, onMounted, onUnmounted } from 'vue'
-import { useRoute } from 'vue-router'
+import { useRoute, useRouter } from 'vue-router'
 import type {
   PlanResponse,
   Task,
   TaskResult,
   ReportGenerationSession,
   ReportTemplateSection,
+  UserQuestion,
+  AnswerReportQuestionRequest,
 } from '../../types'
 import { useConversationStore } from '../../stores/conversation'
 import StepTimeline from '../plan/StepTimeline.vue'
@@ -64,6 +66,7 @@ const props = defineProps<{
 }>()
 
 const route = useRoute()
+const router = useRouter()
 const conversationStore = useConversationStore()
 
 const inputValue = ref('')
@@ -255,7 +258,7 @@ onMounted(() => {
 
   nextTick(() => inputRef.value?.focus())
   for (const task of props.tasks) {
-    if (task.report_session && !['completed', 'failed', 'cancelled'].includes(task.report_session.status)) {
+    if (task.report_session && !['awaiting_confirmation', 'completed', 'failed', 'cancelled'].includes(task.report_session.status)) {
       autoExpandedReportTasks.add(task.id)
       expandedTasks.value.add(task.id)
       startReportPolling(task.id, task.report_session.session_id)
@@ -280,21 +283,30 @@ onUnmounted(() => {
 
 function reportStatusText(status?: string): string {
   const map: Record<string, string> = {
-    created: '已接收', running: '生成中', waiting_user: '等待补充信息', completed: '报告已完成', failed: '生成失败', cancelled: '已取消',
+    created: '已接收', awaiting_confirmation: '待确认计划', running: '生成中', waiting_user: '等待补充信息', completed: '报告已完成', failed: '生成失败', cancelled: '已取消',
   }
   return map[status || ''] || '处理中'
+}
+
+function reportStepText(session?: ReportGenerationSession | null): string {
+  if (!session) return '正在准备报告内容…'
+  if (session.status === 'cancelled') return '任务已取消'
+  const stepMap: Record<string, string> = {
+    cancelled_after_backend_restart: '任务已取消',
+  }
+  return stepMap[session.current_step || ''] || session.current_step || '正在准备报告内容…'
 }
 
 function reportChapters(session?: ReportGenerationSession | null): ReportChapterProgress[] {
   if (!session) return []
   const drafts = session.chapter_drafts || {}
-  const sections = session.plan?.sections?.length
-    ? session.plan.sections
+  const sections = session.plan?.chapters?.length
+    ? session.plan.chapters
     : (session.template_snapshot?.sections || [])
   const order = session.plan?.assembly_order?.length
     ? session.plan.assembly_order
     : sections.map((section) => section.section_id)
-  const sectionById = new Map<string, ReportTemplateSection>(sections.map((section) => [section.section_id, section]))
+  const sectionById = new Map<string, { section_id: string; title: string }>(sections.map((section) => [section.section_id, section]))
   const ids = [...new Set([...order, ...Object.keys(drafts)])]
 
   return ids
@@ -325,6 +337,10 @@ function reportProgressLabel(session?: ReportGenerationSession | null): string {
   if (chapters.length === 0) return '正在准备章节…'
   const completed = chapters.filter((chapter) => chapter.completed).length
   return `章节进度 ${completed}/${chapters.length}`
+}
+
+function openReportPlan(sessionId: string) {
+  void router.push({ name: 'report-detail', params: { sessionId } })
 }
 
 function startReportPolling(taskId: string, sessionId: string) {
@@ -362,7 +378,11 @@ function startReportPolling(taskId: string, sessionId: string) {
     const session = result.data
     const task = conversationStore.tasks.find((t) => t.id === taskId)
     if (!task) return
-    const status = session.status === 'completed' ? 'completed' : session.status === 'failed' ? 'failed' : session.status === 'cancelled' ? 'cancelled' : 'running'
+    const status = session.status === 'completed' ? 'completed'
+      : session.status === 'failed' ? 'failed'
+      : session.status === 'cancelled' ? 'cancelled'
+      : session.status === 'waiting_user' ? 'waiting_user'
+      : 'running'
     const assembled = session.assembled_report
     conversationStore.setTask({
       ...task,
@@ -372,7 +392,7 @@ function startReportPolling(taskId: string, sessionId: string) {
       result: assembled ? { summary: [assembled.executive_summary, ...(assembled.chapters || []).map((c) => c.content)].filter(Boolean).join('\n\n') } : task.result,
       updated_at: session.updated_at,
     })
-    if (['completed', 'failed', 'cancelled'].includes(session.status)) {
+    if (['awaiting_confirmation', 'completed', 'failed', 'cancelled'].includes(session.status)) {
       const timer = reportPollers.get(taskId)
       if (timer) window.clearInterval(timer)
       reportPollers.delete(taskId)
@@ -382,7 +402,12 @@ function startReportPolling(taskId: string, sessionId: string) {
   reportPollers.set(taskId, window.setInterval(poll, 2000))
 }
 
-function toggleCollapse(taskId: string) {
+function toggleCollapse(taskId: string, event?: MouseEvent) {
+  // 点击 badge 时不触发展开/收起
+  if (event) {
+    const target = event.target as HTMLElement
+    if (target.closest('.thought-badge')) return
+  }
   if (expandedTasks.value.has(taskId)) {
     expandedTasks.value.delete(taskId)
   } else {
@@ -393,6 +418,99 @@ function toggleCollapse(taskId: string) {
 function isExpanded(taskId: string): boolean {
   return expandedTasks.value.has(taskId)
 }
+
+// ── 已完成章节整体收起 ──
+const collapsedChapters = ref<Set<string>>(new Set())
+
+function toggleChapters(taskId: string) {
+  if (collapsedChapters.value.has(taskId)) {
+    collapsedChapters.value.delete(taskId)
+  } else {
+    collapsedChapters.value.add(taskId)
+  }
+}
+
+function isChaptersCollapsed(taskId: string): boolean {
+  return collapsedChapters.value.has(taskId)
+}
+
+// ── waiting_user 澄清弹窗 ──
+const waitingDialogTaskId = ref<string | null>(null)
+const waitingDialogTab = ref<'manual' | 'sql'>('manual')
+const waitingDialogAnswer = ref('')
+const waitingDialogSql = ref('')
+const waitingDialogSubmitting = ref(false)
+const waitingDialogError = ref<string | null>(null)
+const waitingDismissedTaskIds = ref<Set<string>>(new Set())
+
+function openWaitingDialog(taskId: string) {
+  waitingDialogTaskId.value = taskId
+  waitingDialogTab.value = 'manual'
+  waitingDialogAnswer.value = ''
+  waitingDialogSql.value = ''
+  waitingDialogError.value = null
+  waitingDismissedTaskIds.value.delete(taskId)
+}
+
+function closeWaitingDialog() {
+  if (waitingDialogTaskId.value) {
+    waitingDismissedTaskIds.value.add(waitingDialogTaskId.value)
+  }
+  waitingDialogTaskId.value = null
+  waitingDialogAnswer.value = ''
+  waitingDialogSql.value = ''
+  waitingDialogError.value = null
+}
+
+const currentWaitingTask = computed(() => {
+  if (!waitingDialogTaskId.value) return null
+  return conversationStore.tasks.find((t) => t.id === waitingDialogTaskId.value) || null
+})
+
+const currentWaitingQuestion = computed<UserQuestion | null>(() => {
+  const task = currentWaitingTask.value
+  if (!task?.report_session?.pending_questions?.length) return null
+  return task.report_session.pending_questions.find((q) => !q.answer) || task.report_session.pending_questions[0]
+})
+
+async function submitWaitingAnswer() {
+  const task = currentWaitingTask.value
+  const question = currentWaitingQuestion.value
+  if (!task?.report_session?.session_id || !question || waitingDialogSubmitting.value) return
+  const payload = waitingDialogTab.value === 'sql'
+    ? waitingDialogSql.value.trim()
+    : waitingDialogAnswer.value.trim()
+  if (!payload) return
+  waitingDialogSubmitting.value = true
+  waitingDialogError.value = null
+  try {
+    const req: AnswerReportQuestionRequest = {
+      question_id: question.question_id,
+      answer: payload,
+      auto_resume: true,
+    }
+    await reportApi.answerQuestion(task.report_session.session_id, req)
+    closeWaitingDialog()
+    startReportPolling(task.id, task.report_session.session_id)
+  } catch (e: unknown) {
+    const msg = e instanceof Error ? e.message : '提交失败，请稍后重试'
+    waitingDialogError.value = msg
+  } finally {
+    waitingDialogSubmitting.value = false
+  }
+}
+
+// 轮询到 waiting_user 时自动弹窗
+watch(
+  () => conversationStore.tasks.filter((t) => t.status === 'waiting_user' && t.report_session),
+  (list) => {
+    const first = list[0]
+    if (first && !waitingDialogTaskId.value && !waitingDismissedTaskIds.value.has(first.id)) {
+      openWaitingDialog(first.id)
+    }
+  },
+  { immediate: true, deep: true },
+)
 
 // 路由是当前会话的最终来源；初始化阶段 Pinia 可能尚未完成 selectSession。
 const currentSessionId = computed(() =>
@@ -527,7 +645,7 @@ async function ensureConversationId(): Promise<string | null> {
 
 watch([() => props.tasks], async () => {
   for (const task of props.tasks) {
-    if (task.report_session && !['completed', 'failed', 'cancelled'].includes(task.report_session.status)) {
+     if (task.report_session && !['awaiting_confirmation', 'completed', 'failed', 'cancelled'].includes(task.report_session.status)) {
       if (!autoExpandedReportTasks.has(task.id)) {
         autoExpandedReportTasks.add(task.id)
         expandedTasks.value.add(task.id)
@@ -585,6 +703,7 @@ async function handleSend() {
     report_session: reportSession,
   }
   conversationStore.setTask(task)
+  conversationStore.updateConversationTitle(conversationId, content)
   startReportPolling(task.id, reportSession.session_id)
   autoExpandedReportTasks.add(task.id)
   expandedTasks.value.add(task.id)
@@ -794,9 +913,13 @@ function pickExampleChip(text: string) {
                   <span class="thought-badge" :class="task.report_session.status">{{ reportStatusText(task.report_session.status) }}</span>
                   <svg class="thought-chevron" :class="{ open: isExpanded(task.id) }" viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="6 9 12 15 18 9" /></svg>
                 </button>
-                <div v-if="isExpanded(task.id)" :id="`report-progress-${task.id}`" class="thought-body report-progress-body">
-                  <div class="report-progress-summary">{{ task.report_session.current_step || '正在准备报告内容…' }}</div>
-                  <div v-if="reportChapters(task.report_session).length" class="report-chapter-progress">
+                 <div v-if="isExpanded(task.id)" :id="`report-progress-${task.id}`" class="thought-body report-progress-body">
+                    <div class="report-progress-summary">{{ task.report_session.current_step || '正在准备报告内容…' }}</div>
+                    <div v-if="task.report_session.status === 'awaiting_confirmation'" class="report-plan-confirm-row">
+                      <span>报告计划已生成，请确认章节和指标后继续。</span>
+                      <button type="button" class="report-plan-confirm-btn" @click="openReportPlan(task.report_session.session_id)">打开计划</button>
+                    </div>
+                    <div v-if="reportChapters(task.report_session).length" class="report-chapter-progress">
                     <div v-for="chapter in reportChapters(task.report_session)" :key="chapter.chapter_id" class="report-chapter-item">
                       <span class="report-chapter-dot" :class="{ done: chapter.completed, active: chapter.section_id === task.report_session.current_chapter_id && !chapter.completed }">{{ chapter.completed ? '✓' : '·' }}</span>
                       <div class="report-chapter-main">
@@ -812,13 +935,21 @@ function pickExampleChip(text: string) {
               </div>
 
               <div v-if="completedReportChapters(task.report_session).length" class="report-chapter-results">
-                <div v-for="chapter in completedReportChapters(task.report_session)" :key="`${task.id}-${chapter.chapter_id}`" class="answer-bubble report-chapter-answer">
-                  <div class="report-final-label">章节生成完成</div>
-                  <article class="report-inline md-content">
-                    <h3>{{ chapter.title }}</h3>
-                    <div v-html="renderMarkdown(chapter.content || '')" />
-                  </article>
+                <div class="chapter-results-head">
+                  <span class="chapter-results-label">已完成章节（{{ completedReportChapters(task.report_session).length }}）</span>
+                  <button type="button" class="toggle-chapters-btn" @click="toggleChapters(task.id)">
+                    {{ isChaptersCollapsed(task.id) ? '展开章节' : '收起章节' }}
+                  </button>
                 </div>
+                <template v-if="!isChaptersCollapsed(task.id)">
+                  <div v-for="chapter in completedReportChapters(task.report_session)" :key="`${task.id}-${chapter.chapter_id}`" class="answer-bubble report-chapter-answer">
+                    <div class="report-final-label">章节生成完成</div>
+                    <article class="report-inline md-content">
+                      <h3>{{ chapter.title }}</h3>
+                      <div v-html="renderMarkdown(chapter.content || '')" />
+                    </article>
+                  </div>
+                </template>
               </div>
 
               <div v-if="task.report_session?.status === 'completed' && task.report_session.assembled_report" class="answer-bubble report-answer-bubble">
@@ -920,19 +1051,19 @@ function pickExampleChip(text: string) {
                 <div class="ac-result-text">任务已完成</div>
               </div>
 
-              <!-- 错误卡片 -->
-              <div v-if="task.status === 'failed' && task.error" class="error-card">
+              <!-- 错误卡片（失败 / 取消且有错误信息） -->
+              <div v-if="(task.status === 'failed' || (task.status === 'cancelled' && task.error)) && task.error" class="error-card">
                 <div class="error-head">
                   <span class="ac-bar error" />
-                  <span class="ac-title">执行失败</span>
+                  <span class="ac-title">{{ task.status === 'cancelled' ? '任务已取消' : '执行失败' }}</span>
                 </div>
                 <div class="ac-body">
                   <div class="ac-error-text">{{ task.error }}</div>
                 </div>
               </div>
 
-              <!-- 中止卡片（无流式内容的情况） -->
-              <div v-if="task.status === 'cancelled' && getStream(task.id).chunks.length === 0" class="answer-bubble answer-empty">
+              <!-- 中止卡片（无错误信息的取消） -->
+              <div v-if="task.status === 'cancelled' && !task.error && getStream(task.id).chunks.length === 0" class="answer-bubble answer-empty">
                 <div class="ac-error-text">任务已被用户中止</div>
               </div>
               <div v-if="task.status === 'cancelled' && getStream(task.id).chunks.length > 0" class="cancelled-hint">
@@ -1057,6 +1188,73 @@ function pickExampleChip(text: string) {
     <p class="disclaimer">
       请勿上传或处理敏感、涉密数据。本平台内容由 AI 生成，仅供参考。
     </p>
+
+    <!-- 澄清问题弹窗 -->
+    <Teleport to="body">
+      <div v-if="waitingDialogTaskId && currentWaitingQuestion" class="waiting-backdrop" @click.self="closeWaitingDialog">
+        <div class="waiting-dialog" role="dialog" aria-modal="true">
+          <div class="waiting-dialog-head">
+            <div class="waiting-dialog-title">需要补充信息</div>
+            <button type="button" class="waiting-dialog-close" :disabled="waitingDialogSubmitting" @click="closeWaitingDialog">×</button>
+          </div>
+          <div class="waiting-dialog-body">
+            <div class="waiting-question-text">{{ currentWaitingQuestion.content }}</div>
+            <div v-if="currentWaitingQuestion.reason" class="waiting-question-reason">{{ currentWaitingQuestion.reason }}</div>
+
+            <div class="waiting-tabs">
+              <button
+                type="button"
+                class="waiting-tab"
+                :class="{ active: waitingDialogTab === 'manual' }"
+                @click="waitingDialogTab = 'manual'"
+                :disabled="waitingDialogSubmitting"
+              >手动填值</button>
+              <button
+                type="button"
+                class="waiting-tab"
+                :class="{ active: waitingDialogTab === 'sql' }"
+                @click="waitingDialogTab = 'sql'"
+                :disabled="waitingDialogSubmitting"
+              >SQL 查询</button>
+            </div>
+
+            <div v-if="waitingDialogTab === 'manual'" class="waiting-tab-body">
+              <textarea
+                v-model="waitingDialogAnswer"
+                class="waiting-textarea"
+                placeholder="请输入需要补充的数据或说明…"
+                rows="4"
+                :disabled="waitingDialogSubmitting"
+              />
+            </div>
+            <div v-else class="waiting-tab-body">
+              <textarea
+                v-model="waitingDialogSql"
+                class="waiting-textarea waiting-sql"
+                placeholder="输入 SQL 查询语句，例如：SELECT * FROM bank_data WHERE 期间 = '2026Q1'"
+                rows="4"
+                :disabled="waitingDialogSubmitting"
+              />
+              <div class="waiting-sql-hint">提示：支持在已上传的数据源上执行 SQL 查询，查询结果会补充给模型继续生成。</div>
+            </div>
+
+            <div v-if="waitingDialogError" class="waiting-dialog-error">{{ waitingDialogError }}</div>
+          </div>
+          <div class="waiting-dialog-foot">
+            <button type="button" class="waiting-btn-cancel" :disabled="waitingDialogSubmitting" @click="closeWaitingDialog">稍后补充</button>
+            <button
+              type="button"
+              class="waiting-btn-submit"
+              :disabled="waitingDialogSubmitting || (waitingDialogTab === 'manual' ? !waitingDialogAnswer.trim() : !waitingDialogSql.trim())"
+              @click="submitWaitingAnswer"
+            >
+              <span v-if="waitingDialogSubmitting" class="spinner-small" />
+              <span v-else>提交并继续生成</span>
+            </button>
+          </div>
+        </div>
+      </div>
+    </Teleport>
   </div>
 </template>
 
@@ -1251,6 +1449,7 @@ function pickExampleChip(text: string) {
 .thought-badge.planning,
 .thought-badge.running,
 .thought-badge.created,
+.thought-badge.awaiting_confirmation,
 .thought-badge.needs_data,
 .thought-badge.waiting_user {
   color: var(--color-primary);
@@ -1270,6 +1469,15 @@ function pickExampleChip(text: string) {
 .thought-badge.cancelled {
   color: var(--color-text-light);
   background: var(--color-bg-hover, #f0ecf5);
+}
+
+.thought-badge.clickable {
+  cursor: pointer;
+  transition: opacity 0.15s;
+}
+
+.thought-badge.clickable:hover {
+  opacity: 0.75;
 }
 
 .thought-chevron {
@@ -1299,6 +1507,8 @@ function pickExampleChip(text: string) {
 .report-progress-body { padding: 14px 16px 16px; }
 .report-progress-summary { color: var(--color-text-medium); font-size: 13px; margin-bottom: 12px; }
 .report-progress-count { flex-shrink: 0; color: var(--color-text-light); font-size: 12px; white-space: nowrap; }
+.report-plan-confirm-row { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin: 0 0 12px; padding: 10px 12px; border: 1px solid #f5c76a; border-radius: 9px; background: #fffbf0; color: var(--color-text-medium); font-size: 12.5px; }
+.report-plan-confirm-btn { flex-shrink: 0; border: 0; border-radius: 8px; padding: 6px 11px; background: var(--color-primary); color: #fff; cursor: pointer; font: inherit; font-size: 12px; font-weight: 600; }
 .report-chapter-progress { display: flex; flex-direction: column; gap: 10px; }
 .report-chapter-item { display: flex; gap: 10px; align-items: flex-start; }
 .report-chapter-dot { width: 22px; height: 22px; border-radius: 50%; background: var(--color-bg-gray); color: var(--color-text-light); display: inline-flex; align-items: center; justify-content: center; flex-shrink: 0; font-weight: 700; }
@@ -2042,5 +2252,56 @@ function pickExampleChip(text: string) {
   .welcome-title {
     font-size: 22px;
   }
+}
+
+/* ── 已完成章节收起按钮 ── */
+.chapter-results-head { display: flex; align-items: center; justify-content: space-between; padding: 2px 0; }
+.chapter-results-label { font-size: 13px; font-weight: 600; color: var(--color-text-dark); }
+.toggle-chapters-btn { background: #fff; border: 1px solid var(--color-primary); border-radius: 6px; padding: 3px 10px; font-size: 12px; color: var(--color-primary); cursor: pointer; transition: background .15s; }
+.toggle-chapters-btn:hover { background: var(--color-primary-light); }
+
+/* ── waiting_user 澄清弹窗 ── */
+.waiting-backdrop {
+  position: fixed; inset: 0; background: rgba(0, 0, 0, 0.45);
+  display: flex; align-items: center; justify-content: center;
+  z-index: 9999; padding: 20px;
+}
+.waiting-dialog { background: #fff; border-radius: 12px; width: 100%; max-width: 520px; box-shadow: 0 12px 40px rgba(0, 0, 0, 0.2); overflow: hidden; }
+.waiting-dialog-head { display: flex; align-items: center; justify-content: space-between; padding: 14px 20px; background: var(--color-primary); color: #fff; }
+.waiting-dialog-title { font-size: 15px; font-weight: 600; }
+.waiting-dialog-close { background: none; border: none; color: #fff; font-size: 20px; line-height: 1; cursor: pointer; padding: 0 2px; opacity: 0.85; transition: opacity .15s; }
+.waiting-dialog-close:hover { opacity: 1; }
+.waiting-dialog-close:disabled { opacity: 0.4; cursor: not-allowed; }
+.waiting-dialog-body { padding: 20px; }
+.waiting-question-text { font-size: 14px; font-weight: 600; color: var(--color-text-dark); line-height: 1.6; }
+.waiting-question-reason { margin-top: 6px; font-size: 12px; color: var(--color-text-light); padding: 8px 10px; background: #f7f7fb; border-radius: 6px; line-height: 1.5; }
+.waiting-tabs { display: flex; gap: 6px; margin-top: 16px; border-bottom: 1px solid var(--color-border); padding-bottom: 0; }
+.waiting-tab { padding: 7px 14px; font-size: 13px; font-weight: 500; background: none; border: none; cursor: pointer; color: var(--color-text-light); border-bottom: 2px solid transparent; margin-bottom: -1px; transition: all .15s; }
+.waiting-tab:hover { color: var(--color-primary); }
+.waiting-tab.active { color: var(--color-primary); border-bottom-color: var(--color-primary); }
+.waiting-tab:disabled { opacity: 0.5; cursor: not-allowed; }
+.waiting-tab-body { margin-top: 14px; }
+.waiting-textarea { width: 100%; resize: vertical; font-size: 14px; padding: 10px 12px; border-radius: 8px; border: 1px solid var(--color-border); background: #fff; font-family: inherit; line-height: 1.6; box-sizing: border-box; transition: border-color .15s; }
+.waiting-textarea:focus { outline: none; border-color: var(--color-primary); }
+.waiting-textarea:disabled { background: #f5f5f5; cursor: not-allowed; }
+.waiting-sql { font-family: 'Consolas', 'Monaco', 'Courier New', monospace; font-size: 13px; }
+.waiting-sql-hint { margin-top: 6px; font-size: 12px; color: var(--color-text-light); }
+.waiting-dialog-foot { display: flex; justify-content: flex-end; gap: 10px; padding: 14px 20px; border-top: 1px solid var(--color-border); background: #fafafa; }
+.waiting-btn-cancel { padding: 7px 16px; font-size: 13px; border-radius: 6px; background: #fff; border: 1px solid var(--color-border); color: var(--color-text-light); cursor: pointer; transition: all .15s; }
+.waiting-btn-cancel:hover { border-color: var(--color-primary); color: var(--color-primary); }
+.waiting-btn-cancel:disabled { opacity: 0.5; cursor: not-allowed; }
+.waiting-btn-submit { padding: 7px 18px; font-size: 13px; border-radius: 6px; background: var(--color-primary); border: none; color: #fff; cursor: pointer; transition: opacity .15s; display: inline-flex; align-items: center; gap: 6px; }
+.waiting-btn-submit:hover { opacity: 0.88; }
+.waiting-btn-submit:disabled { opacity: 0.5; cursor: not-allowed; }
+
+.waiting-dialog-error {
+  margin-top: 12px;
+  padding: 8px 12px;
+  border-radius: 6px;
+  background: #fef2f2;
+  border: 1px solid #fecaca;
+  color: #dc2626;
+  font-size: 13px;
+  line-height: 1.5;
 }
 </style>

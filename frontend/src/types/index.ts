@@ -24,6 +24,8 @@ export type {
   ReportTemplateSection,
   ReportTemplate,
   ReportPlan,
+  ReportGlobalContext,
+  ChapterPlan,
   DataSourceMetadata,
   UserQuestion,
   ChapterDraft,
@@ -32,6 +34,7 @@ export type {
   ReportGenerationSession,
   CreateReportGenerationRequest,
   AnswerReportQuestionRequest,
+  ConfirmReportPlanRequest,
   LegacyProfileReportResponse,
 } from './report'
 

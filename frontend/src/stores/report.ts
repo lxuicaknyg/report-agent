@@ -33,7 +33,7 @@ export const useReportStore = defineStore('report', () => {
       if (res.success && res.data) {
         currentSession.value = res.data
         const st = res.data.status
-        if (st === 'completed' || st === 'failed' || st === 'cancelled') {
+        if (st === 'completed' || st === 'failed' || st === 'cancelled' || st === 'waiting_user') {
           stopPolling()
         }
       } else if (res.error?.code === 'REQUEST_FAILED' && (
@@ -203,6 +203,24 @@ export const useReportStore = defineStore('report', () => {
     }
   }
 
+  async function confirmPlan(sessionId: string, request: import('../types').ConfirmReportPlanRequest) {
+    loadingSession.value = true
+    error.value = null
+    try {
+      const res = await reportApi.confirmPlan(sessionId, request)
+      if (res.success && res.data) {
+        currentSession.value = res.data
+        startPolling(sessionId)
+      } else if (res.error) {
+        error.value = res.error.message
+      }
+    } catch (e) {
+      error.value = String(e)
+    } finally {
+      loadingSession.value = false
+    }
+  }
+
   function addTemplate(tpl: ReportTemplate) {
     templates.value.unshift(tpl)
   }
@@ -249,6 +267,7 @@ export const useReportStore = defineStore('report', () => {
     reloadSession,
     answerQuestion,
     resumeSession,
+    confirmPlan,
     addTemplate,
     clearError,
     $reset,

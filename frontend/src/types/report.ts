@@ -2,6 +2,7 @@ import type { Evidence } from './analysis'
 
 export type ReportGenerationStatus =
   | 'created'
+  | 'awaiting_confirmation'
   | 'running'
   | 'waiting_user'
   | 'completed'
@@ -32,13 +33,30 @@ export interface ReportTemplate {
 
 export interface ReportPlan {
   plan_id: string
+  version: number
+  status: 'generated' | 'awaiting_confirmation' | 'approved' | 'executing' | 'completed'
   template_id: string
   title: string
   instruction: string
-  sections?: ReportTemplateSection[]
+  global_context: ReportGlobalContext
+  chapters?: ChapterPlan[]
+  sections?: ChapterPlan[]
   assembly_order?: string[]
   created_at: string
 }
+
+export interface ReportGlobalContext {
+  report_period?: string | null
+  dimensions: Record<string, string>
+}
+
+export interface ChapterPlan {
+  section_id: string
+  title: string
+  metrics: string[]
+  order?: number
+}
+
 
 export interface DataSourceMetadata {
   dataset_id: string
@@ -47,6 +65,7 @@ export interface DataSourceMetadata {
   description?: string | null
   sheets?: Record<string, unknown>[]
   columns?: Record<string, unknown>[]
+  sample_rows?: Record<string, unknown>[]
   metadata?: Record<string, unknown>
 }
 
@@ -125,6 +144,17 @@ export interface AnswerReportQuestionRequest {
   question_id: string
   answer: string
   auto_resume?: boolean
+}
+
+export interface ConfirmReportPlanRequest {
+  title?: string | null
+  report_period?: string | null
+  dimensions?: Record<string, string>
+  chapters?: Array<{
+    section_id: string
+    title: string
+    metrics: string[]
+  }>
 }
 
 export interface LegacyProfileReportResponse {

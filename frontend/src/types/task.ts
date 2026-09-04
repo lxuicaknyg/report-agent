@@ -3,6 +3,7 @@ export type TaskStatus =
   | 'planning'
   | 'running'
   | 'needs_data'
+  | 'waiting_user'
   | 'completed'
   | 'failed'
   | 'cancelled'
