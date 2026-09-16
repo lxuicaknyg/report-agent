@@ -2,7 +2,16 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 
-from ...core.models import ColumnSchema, DataReadResult, DatasetInfo, DatasetProfile, QueryResult, SheetInfo
+from ...core.models import (
+    AggregateRequest,
+    AggregateResult,
+    ColumnSchema,
+    DataReadResult,
+    DatasetInfo,
+    DatasetProfile,
+    QueryResult,
+    SheetInfo,
+)
 
 
 class RegisteredDataSource(ABC):
@@ -31,6 +40,9 @@ class RegisteredDataSource(ABC):
         limit: int = 100,
     ) -> DataReadResult:
         raise NotImplementedError(f"Row reading is not supported by {self.source_type}")
+
+    async def aggregate(self, dataset_id: str, request: AggregateRequest) -> AggregateResult:
+        raise NotImplementedError(f"Aggregation is not supported by {self.source_type}")
 
     @abstractmethod
     async def profile(self, dataset_id: str) -> DatasetProfile:

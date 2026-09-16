@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from datetime import date, datetime, time
 from decimal import Decimal
-import re
 import time as clock
 from pathlib import Path
 from typing import Any, Iterable
@@ -11,6 +10,10 @@ import pandas as pd
 from openpyxl import load_workbook
 
 from ...core.models import (
+    AggregateFilter,
+    AggregateMetric,
+    AggregateRequest,
+    AggregateResult,
     ColumnSchema,
     DataReadResult,
     DatasetInfo,
@@ -39,10 +42,6 @@ def _normalize_headers(values: Iterable[Any]) -> list[str]:
         used[name] = count + 1
         headers.append(name if count == 0 else f"{name}_{count + 1}")
     return headers
-
-
-def _safe_identifier(value: str) -> str:
-    return re.sub(r"[^a-zA-Z0-9_]", "_", value).strip("_") or "dataset"
 
 
 class ExcelDataSource(RegisteredDataSource):
@@ -91,6 +90,7 @@ class ExcelDataSource(RegisteredDataSource):
         return [
             SheetInfo(
                 sheet_name=sheet_name,
+                table_name=self.table_name(sheet_name),
                 columns=self._read_headers(sheet_name),
                 row_count=self._row_count(sheet_name),
             )
@@ -205,6 +205,74 @@ class ExcelDataSource(RegisteredDataSource):
             warnings=warnings,
         )
 
+    async def aggregate(self, dataset_id: str, request: AggregateRequest) -> AggregateResult:
+        """Run a slot-filled aggregation over one sheet.
+
+        The caller says which column to total and how to slice it; every sum,
+        count and average is computed here. Nothing in the request is a string
+        the caller composed, so there is no query to get wrong and no room to
+        smuggle a calculation past this boundary.
+        """
+        self._check_dataset(dataset_id)
+        sheet_name = request.sheet_name or self._sheet_names[0]
+        if sheet_name not in self._sheet_names:
+            raise ValueError(
+                f"Sheet not found: {sheet_name}. Available sheets: {self._sheet_names}"
+            )
+        frame = pd.read_excel(self.path, sheet_name=sheet_name)
+        known = list(frame.columns)
+
+        referenced = (
+            [item.column for item in request.filters]
+            + list(request.group_by)
+            + [item.column for item in request.metrics]
+        )
+        unknown = [name for name in referenced if name not in known]
+        if unknown:
+            raise ValueError(f"Unknown columns: {', '.join(unknown)}. Available: {known}")
+        if not request.metrics and not request.group_by:
+            raise ValueError("Provide at least one metric or one group_by column")
+
+        for item in request.filters:
+            frame = frame[_filter_mask(frame, item)]
+        matched = len(frame)
+
+        if request.metrics:
+            named = {
+                (item.alias or f"{item.function}_{item.column}"): item
+                for item in request.metrics
+            }
+            if request.group_by:
+                grouped = frame.groupby(request.group_by, dropna=False)
+                result = pd.DataFrame(
+                    {alias: _apply(grouped[item.column], item.function) for alias, item in named.items()}
+                ).reset_index()
+            else:
+                result = pd.DataFrame(
+                    [{alias: _apply(frame[item.column], item.function) for alias, item in named.items()}]
+                )
+        else:
+            # No metric asked for: the caller wants the distinct combinations,
+            # which is how a dimension's values get enumerated.
+            result = frame[request.group_by].drop_duplicates().reset_index(drop=True)
+
+        order_by = request.order_by
+        if order_by:
+            if order_by not in result.columns:
+                raise ValueError(f"Unknown order_by column: {order_by}. Available: {list(result.columns)}")
+            result = result.sort_values(order_by, ascending=not request.descending)
+        result = result.head(request.limit)
+
+        rows = result.where(pd.notna(result), None).to_dict("records")
+        return AggregateResult(
+            dataset_id=dataset_id,
+            sheet_name=sheet_name,
+            columns=[str(column) for column in result.columns],
+            rows=[{str(key): _plain(value) for key, value in row.items()} for row in rows],
+            row_count=len(rows),
+            matched_rows=matched,
+        )
+
     async def query(self, dataset_id: str, sql: str, limit: int = 500) -> QueryResult:
         self._check_dataset(dataset_id)
         self._assert_read_only(sql)
@@ -285,17 +353,27 @@ class ExcelDataSource(RegisteredDataSource):
 
             connection = duckdb.connect(database=":memory:")
             for sheet_name, frame in frames.items():
-                table_name = f"{_safe_identifier(self.dataset_id)}__{_safe_identifier(sheet_name)}"
-                connection.register(table_name, frame)
+                connection.register(self.table_name(sheet_name), frame)
             self._query_backend = ("duckdb", connection)
         except ImportError:
             import sqlite3
 
             connection = sqlite3.connect(":memory:", check_same_thread=False)
             for sheet_name, frame in frames.items():
-                frame.to_sql(f"{_safe_identifier(self.dataset_id)}__{_safe_identifier(sheet_name)}", connection, if_exists="replace", index=False)
+                frame.to_sql(self.table_name(sheet_name), connection, if_exists="replace", index=False)
             self._query_backend = ("sqlite", connection)
         return self._query_backend
+
+    @staticmethod
+    def table_name(sheet_name: str) -> str:
+        """The SQL table a sheet is queryable as.
+
+        The sheet name is used as-is and quoted in SQL. Sanitising it to ASCII
+        mapped every all-CJK sheet name onto the same identifier, so a workbook
+        with Chinese sheet names registered four tables under one name and
+        every query silently hit whichever sheet was loaded last.
+        """
+        return sheet_name
 
     @staticmethod
     def _assert_read_only(sql: str) -> None:
@@ -306,3 +384,81 @@ class ExcelDataSource(RegisteredDataSource):
     def _check_dataset(self, dataset_id: str) -> None:
         if dataset_id != self.dataset_id:
             raise KeyError(f"Dataset not found: {dataset_id}")
+
+
+def _plain(value: Any) -> Any:
+    """Numbers a JSON payload can carry, dates a reader can recognise."""
+    if isinstance(value, (datetime, date, time, pd.Timestamp)):
+        return value.isoformat()
+    if isinstance(value, Decimal):
+        return float(value)
+    if hasattr(value, "item"):  # numpy scalar
+        return value.item()
+    return value
+
+
+def _apply(series: Any, function: str) -> Any:
+    if function == "sum":
+        return series.sum()
+    if function == "count":
+        return series.count()
+    if function == "count_distinct":
+        return series.nunique()
+    if function == "avg":
+        return series.mean()
+    if function == "min":
+        return series.min()
+    if function == "max":
+        return series.max()
+    raise ValueError(f"Unsupported aggregate function: {function}")
+
+
+def _filter_mask(frame: pd.DataFrame, item: AggregateFilter) -> Any:
+    """Compare one column to one value.
+
+    Dates and months are the filter that matters most here and they arrive as
+    strings ("2026-01"), so a column of timestamps is compared as text — that
+    makes a prefix like "2026-01" behave the way the caller means it to.
+    """
+    column = frame[item.column]
+    value = item.value
+    if item.op == "in":
+        values = value if isinstance(value, list) else [value]
+        return _comparable(column, values[0]).isin([_scalar(one) for one in values])
+    if item.op == "between":
+        if not isinstance(value, (list, tuple)) or len(value) != 2:
+            raise ValueError("between expects a [low, high] pair")
+        low, high = (_scalar(value[0]), _scalar(value[1]))
+        compared = _comparable(column, value[0])
+        return (compared >= low) & (compared <= high)
+    if item.op == "contains":
+        return column.astype(str).str.contains(str(value), na=False)
+    compared = _comparable(column, value)
+    scalar = _scalar(value)
+    if item.op == "eq":
+        return compared == scalar
+    if item.op == "ne":
+        return compared != scalar
+    if item.op == "gte":
+        return compared >= scalar
+    if item.op == "lte":
+        return compared <= scalar
+    raise ValueError(f"Unsupported filter operator: {item.op}")
+
+
+def _comparable(column: pd.Series, value: Any) -> pd.Series:
+    """Line a column up with the value it is being compared to.
+
+    A month written as "2026-01" cannot be compared to a timestamp, and the
+    caller has no way to know how the sheet stored its dates; rendering the
+    column as text when the value is text makes both spellings work.
+    """
+    if isinstance(value, str) and pd.api.types.is_datetime64_any_dtype(column):
+        return column.astype(str).str.slice(0, len(value))
+    if isinstance(value, str):
+        return column.astype(str)
+    return column
+
+
+def _scalar(value: Any) -> Any:
+    return value

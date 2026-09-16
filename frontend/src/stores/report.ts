@@ -3,13 +3,15 @@ import { ref } from 'vue'
 import type {
   ReportTemplate,
   ReportGenerationSession,
-  CreateReportGenerationRequest,
-  AnswerReportQuestionRequest,
 } from '../types'
 import { reportApi } from '../services/api/reports'
 
 const POLL_INTERVAL_MS = 2000
 
+/**
+ * Read-only report state: templates plus whichever session is being viewed.
+ * Reports are driven from the conversation, so nothing here mutates one.
+ */
 export const useReportStore = defineStore('report', () => {
   const templates = ref<ReportTemplate[]>([])
   const currentSession = ref<ReportGenerationSession | null>(null)
@@ -33,7 +35,7 @@ export const useReportStore = defineStore('report', () => {
       if (res.success && res.data) {
         currentSession.value = res.data
         const st = res.data.status
-        if (st === 'completed' || st === 'failed' || st === 'cancelled' || st === 'waiting_user') {
+        if (st === 'completed' || st === 'failed' || st === 'cancelled') {
           stopPolling()
         }
       } else if (res.error?.code === 'REQUEST_FAILED' && (
@@ -42,7 +44,7 @@ export const useReportStore = defineStore('report', () => {
       )) {
         // 后端使用内存 session 时，重启会使旧 session 失效；停止轮询，避免持续刷 404。
         stopPolling()
-        error.value = '报告任务已失效，请重新提交生成'
+        error.value = '报告会话已失效，请重新提交生成'
       }
     }, POLL_INTERVAL_MS)
   }
@@ -121,29 +123,6 @@ export const useReportStore = defineStore('report', () => {
     }
   }
 
-  async function createSession(request: CreateReportGenerationRequest) {
-    loadingSession.value = true
-    error.value = null
-    currentSession.value = null
-    try {
-      const res = await reportApi.createSession(request)
-      if (res.success && res.data) {
-        currentSession.value = res.data
-        if (request.auto_start && (res.data.status === 'created' || res.data.status === 'running')) {
-          startPolling(res.data.session_id)
-        }
-        return res.data
-      }
-      if (res.error) error.value = res.error.message
-      return null
-    } catch (e) {
-      error.value = String(e)
-      return null
-    } finally {
-      loadingSession.value = false
-    }
-  }
-
   async function reloadSession(sessionId: string) {
     loadingSession.value = true
     error.value = null
@@ -155,62 +134,6 @@ export const useReportStore = defineStore('report', () => {
         if (st === 'created' || st === 'running' || st === 'waiting_user') {
           startPolling(sessionId)
         }
-      } else if (res.error) {
-        error.value = res.error.message
-      }
-    } catch (e) {
-      error.value = String(e)
-    } finally {
-      loadingSession.value = false
-    }
-  }
-
-  async function answerQuestion(sessionId: string, request: AnswerReportQuestionRequest) {
-    loadingSession.value = true
-    error.value = null
-    try {
-      const res = await reportApi.answerQuestion(sessionId, request)
-      if (res.success && res.data) {
-        currentSession.value = res.data
-        if (request.auto_resume) {
-          startPolling(sessionId)
-        }
-      } else if (res.error) {
-        error.value = res.error.message
-      }
-    } catch (e) {
-      error.value = String(e)
-    } finally {
-      loadingSession.value = false
-    }
-  }
-
-  async function resumeSession(sessionId: string) {
-    loadingSession.value = true
-    error.value = null
-    try {
-      const res = await reportApi.resumeSession(sessionId)
-      if (res.success && res.data) {
-        currentSession.value = res.data
-        startPolling(sessionId)
-      } else if (res.error) {
-        error.value = res.error.message
-      }
-    } catch (e) {
-      error.value = String(e)
-    } finally {
-      loadingSession.value = false
-    }
-  }
-
-  async function confirmPlan(sessionId: string, request: import('../types').ConfirmReportPlanRequest) {
-    loadingSession.value = true
-    error.value = null
-    try {
-      const res = await reportApi.confirmPlan(sessionId, request)
-      if (res.success && res.data) {
-        currentSession.value = res.data
-        startPolling(sessionId)
       } else if (res.error) {
         error.value = res.error.message
       }
@@ -263,11 +186,7 @@ export const useReportStore = defineStore('report', () => {
     loadTemplates,
     loadSessions,
     uploadTemplate,
-    createSession,
     reloadSession,
-    answerQuestion,
-    resumeSession,
-    confirmPlan,
     addTemplate,
     clearError,
     $reset,

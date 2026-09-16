@@ -27,7 +27,7 @@ async function onUpload(e: Event) {
 }
 
 function goCreate() {
-  router.push({ name: 'create-report' })
+  router.push({ name: 'conversation-new' })
 }
 
 function sortedSections(t: ReportTemplate): ReportTemplateSection[] {
@@ -63,7 +63,7 @@ function levelIndent(level: number | undefined): number {
           :disabled="store.loadingTemplate"
           @change="onUpload"
         />
-        <button type="button" class="secondary-btn" :disabled="store.templates.length === 0" @click="goCreate">创建报告</button>
+        <button type="button" class="secondary-btn" @click="goCreate">去对话创建报告</button>
       </div>
     </header>
 
@@ -91,7 +91,7 @@ function levelIndent(level: number | undefined): number {
           <div class="tpl-outline">
             <div class="outline-title">章节结构预览</div>
             <div v-if="!t.sections?.length" class="outline-empty muted">
-              章节层级解析待后端接口就绪，当前仅展示总数
+              章节 Heading 层级解析待后端 P2 第⑧条接口抵达，当前仅展示总数
             </div>
             <ul v-else class="outline-tree">
               <li
@@ -108,14 +108,14 @@ function levelIndent(level: number | undefined): number {
           </div>
 
           <div class="tpl-actions">
-            <button type="button" class="primary-btn block" @click="router.push({ name: 'create-report', query: { template_id: t.template_id } })">
-              基于此创建
+            <button type="button" class="primary-btn block" @click="goCreate">
+              在对话中创建报告
             </button>
             <button
               type="button"
               class="secondary-btn block"
               disabled
-              title="删除模板功能待后端接口就绪后启用"
+              title="删除模板接口待后端 P1 第④条抵达"
             >
               删除模板（待接口）
             </button>

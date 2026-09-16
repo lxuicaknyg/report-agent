@@ -1,14 +1,31 @@
 from __future__ import annotations
 
+from collections.abc import Callable
+
 from .sources.base import RegisteredDataSource
-from ..core.models import DataReadResult, DatasetInfo, DatasetProfile, QueryResult, SheetInfo
+from ..core.models import (
+    AggregateRequest,
+    AggregateResult,
+    DataReadResult,
+    DatasetInfo,
+    DatasetProfile,
+    QueryResult,
+    SheetInfo,
+)
 
 
 class DataCatalog:
     """统一管理 Excel、CSV、DuckDB 和外部 SQL 数据源。"""
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        restore: Callable[[str], RegisteredDataSource | None] | None = None,
+    ) -> None:
         self._sources: dict[str, RegisteredDataSource] = {}
+        #: Looks up a dataset the catalog has never seen, so an upload can
+        #: outlive the process that registered it.
+        self._restore = restore
 
     def register(self, source: RegisteredDataSource) -> None:
         for dataset in source.datasets:
@@ -17,10 +34,15 @@ class DataCatalog:
             self._sources[dataset.dataset_id] = source
 
     def get_source(self, dataset_id: str) -> RegisteredDataSource:
-        try:
-            return self._sources[dataset_id]
-        except KeyError as exc:
-            raise KeyError(f"Dataset not found: {dataset_id}") from exc
+        source = self._sources.get(dataset_id)
+        if source is None and self._restore is not None:
+            recovered = self._restore(dataset_id)
+            if recovered is not None:
+                self.register(recovered)
+                source = self._sources.get(dataset_id)
+        if source is None:
+            raise KeyError(f"Dataset not found: {dataset_id}")
+        return source
 
     async def list_datasets(self) -> list[DatasetInfo]:
         return [dataset for source in self._sources.values() for dataset in source.datasets]
@@ -49,6 +71,9 @@ class DataCatalog:
             offset=offset,
             limit=limit,
         )
+
+    async def aggregate(self, dataset_id: str, request: AggregateRequest) -> AggregateResult:
+        return await self.get_source(dataset_id).aggregate(dataset_id, request)
 
     async def profile(self, dataset_id: str) -> DatasetProfile:
         return await self.get_source(dataset_id).profile(dataset_id)

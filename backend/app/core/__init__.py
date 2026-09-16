@@ -17,10 +17,14 @@ from .models import (
 )
 from .agent import ToolCallingAgent
 from .reports import (
-    AnswerReportQuestionRequest,
+    ChapterSupplement,
+    MetricFinding,
+    QuestionResolutionInput,
+    ResolveQuestionsRequest,
     AssembledReport,
     ChapterPlan,
     ChapterDraft,
+    ReportFact,
     ChapterWriterInput,
     ChapterWriterResult,
     DataSourceMetadata,
@@ -32,7 +36,6 @@ from .reports import (
     ReportPlan,
     ReportTemplate,
     ReportTemplateSection,
-    ConfirmReportPlanRequest,
     UserQuestion,
 )
 from .tooling import Tool, ToolContext, ToolRegistry, ToolResult
@@ -40,11 +43,14 @@ from .tooling import Tool, ToolContext, ToolRegistry, ToolResult
 __all__ = [
     "AnalysisRequest",
     "AnalysisResult",
-    "AnswerReportQuestionRequest",
-    "ConfirmReportPlanRequest",
+    "ChapterSupplement",
+    "MetricFinding",
+    "QuestionResolutionInput",
+    "ResolveQuestionsRequest",
     "AssembledReport",
     "ChapterPlan",
     "ChapterDraft",
+    "ReportFact",
     "ChapterWriterInput",
     "ChapterWriterResult",
     "DataSourceMetadata",
@@ -64,7 +70,6 @@ __all__ = [
     "ReportPlan",
     "ReportTemplate",
     "ReportTemplateSection",
-    "ConfirmReportPlanRequest",
     "RequestContext",
     "SheetInfo",
     "Tool",

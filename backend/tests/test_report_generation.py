@@ -9,10 +9,10 @@ from app.reporting.report_generation import ReportGenerationService
 from app.reporting.renderer import MarkdownReportRenderer
 from app.reporting.template_parser import ReportTemplateParser
 from app.core.reports import (
-    AnswerReportQuestionRequest,
+    QuestionResolutionInput,
+    ResolveQuestionsRequest,
     ChapterDraft,
     ChapterWriterResult,
-    ConfirmReportPlanRequest,
     CreateReportGenerationRequest,
     ReportGenerationStatus,
     UserQuestion,
@@ -221,9 +221,9 @@ def test_chapter_writer_can_pause_for_user_and_resume():
         def __init__(self):
             self.inputs = []
 
-        async def write(self, input, session):
+        async def write(self, input, session, checkpoint=None):
             self.inputs.append(input)
-            if not session.answers:
+            if not session.resolved_questions:
                 return ChapterWriterResult(
                     status="waiting_user",
                     questions=[UserQuestion(question_id="q-1", chapter_id=input.section.section_id, content="请确认是否继续")],
@@ -234,7 +234,7 @@ def test_chapter_writer_can_pause_for_user_and_resume():
                     chapter_id=input.section.section_id,
                     section_id=input.section.section_id,
                     title=input.section.title,
-                    content=f"已根据回答生成：{session.answers['q-1']}",
+                    content=f"已根据回答生成：{session.resolved_questions[0].value}",
                 ),
             )
 
@@ -264,19 +264,64 @@ def test_chapter_writer_can_pause_for_user_and_resume():
         assert session.plan is not None
         assert session.data_source_metadata[0].sheets[0]["columns"][0]["name"] == "value"
 
-        session = await service.confirm_plan(
-            session.session_id,
-            ConfirmReportPlanRequest(chapters=session.plan.chapters),
-        )
+        session = await service.approve_plan(session.session_id)
         assert session.status == ReportGenerationStatus.WAITING_USER
         assert session.pending_questions[0].question_id == "q-1"
 
-        resumed = await service.answer_question(
+        resumed = await service.resolve_questions(
             session.session_id,
-            AnswerReportQuestionRequest(question_id="q-1", answer="继续"),
+            ResolveQuestionsRequest(
+                resolutions=[
+                    QuestionResolutionInput(question_id="q-1", action="value", value="继续")
+                ]
+            ),
         )
         assert resumed.status == ReportGenerationStatus.COMPLETED
         assert writer.inputs[0].data_sources[0].dataset_id == "excel_002"
-        assert writer.inputs[1].previous_answers["q-1"] == "继续"
+        assert writer.inputs[1].supplements[0].value == "继续"
+
+    asyncio.run(run())
+
+
+def test_planner_collapses_multi_value_dimensions():
+    """Models answer a dimension with a list; that must not void the plan."""
+    planner = ReportPlanner()
+    assert planner._coerce_dimensions({"客户等级": ["A", "B", "C"], "区域": "华东"}) == {
+        "客户等级": "A、B、C",
+        "区域": "华东",
+    }
+    assert planner._coerce_dimensions({"空": [], "无效": {"a": 1}, "数字": 2024}) == {"数字": "2024"}
+    assert planner._coerce_dimensions(None) == {}
+
+
+def test_a_session_waiting_on_the_user_survives_a_restart():
+    """Nothing is running while we wait for data, so a restart must not kill it."""
+    import tempfile
+    from pathlib import Path
+
+    from app.core.reports import ReportGenerationSession
+    from app.infrastructure.report_repositories import PersistentReportSessionRepository
+
+    path = Path(tempfile.mkdtemp()) / "sessions.json"
+
+    async def run():
+        repo = PersistentReportSessionRepository(path)
+        waiting = ReportGenerationSession(
+            session_id="report_waiting",
+            user_id="local-user",
+            template_id="t",
+            dataset_ids=["d"],
+            instruction="生成",
+            status=ReportGenerationStatus.WAITING_USER,
+        )
+        running = waiting.model_copy(
+            update={"session_id": "report_running", "status": ReportGenerationStatus.RUNNING}
+        )
+        await repo.save(waiting)
+        await repo.save(running)
+
+        restarted = PersistentReportSessionRepository(path)
+        assert (await restarted.get("report_waiting")).status == ReportGenerationStatus.WAITING_USER
+        assert (await restarted.get("report_running")).status == ReportGenerationStatus.CANCELLED
 
     asyncio.run(run())

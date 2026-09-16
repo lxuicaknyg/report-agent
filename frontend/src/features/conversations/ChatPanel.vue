@@ -1,23 +1,12 @@
 <script setup lang="ts">
-import { ref, computed, nextTick, watch, onMounted, onUnmounted } from 'vue'
-import { useRoute, useRouter } from 'vue-router'
-import type {
-  PlanResponse,
-  Task,
-  TaskResult,
-  ReportGenerationSession,
-  ReportTemplateSection,
-  UserQuestion,
-  AnswerReportQuestionRequest,
-} from '../../types'
+import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
+import type { Message, QuestionResolutionInput } from '../../types'
 import { useConversationStore } from '../../stores/conversation'
-import StepTimeline from '../plan/StepTimeline.vue'
-import StreamContent from './StreamContent.vue'
 import SlashCommandMenu, { type SlashCommandItem } from './SlashCommandMenu.vue'
-import { useAllTaskStreams } from '../../composables/useAllTaskStreams'
-import { sseClient } from '../../services/events'
-import { taskApi } from '../../services/api'
-import { reportApi } from '../../services/api/reports'
+import PlanCard from './messages/PlanCard.vue'
+import ProgressFlow from './messages/ProgressFlow.vue'
+import QuestionCard from './messages/QuestionCard.vue'
+import ReportCard from './messages/ReportCard.vue'
 import { renderMarkdown } from '../../utils/markdown'
 
 type UploadKind = 'word' | 'excel'
@@ -45,63 +34,158 @@ const SLASH_COMMANDS: SlashCommandItem[] = [
     id: 'generate-report',
     title: '生成报告',
     icon: 'report',
-    description: '按模板结构自动规划章节 → 查询 → 生成带指标的完整 Markdown 报告',
+    description: '按模板结构自动规划章节 → 查询 → 生成带指标的完整报告',
     template:
-      '请为我生成一份【报告主题】的分析报告。\n\n报告周期：2026 Q2（可修改）\n重点维度：\n- 维度 1（例：绿色信贷规模）\n- 维度 2（例：对公 vs 零售对比）\n- 维度 3（例：同比/环比变化）\n\n输出要求：\n1. 至少 6 个章节（背景、核心指标、结构拆解、趋势、风险、建议）\n2. 每个指标后注明口径\n3. 结尾给出 3 条可落地的业务建议\n4. 直接输出 Markdown，不要额外说明\n\n请开始规划：',
-  },
-  {
-    id: 'polish-report',
-    title: '润色报告',
-    icon: 'polish',
-    description: '把已有 Markdown / 草稿按专业金融报告风格重写：结构统一、数字格式化、结论先行',
-    template:
-      '请对下面这份报告草稿进行专业润色，保持数据、结论、章节名称 100% 不变，仅优化表达：\n\n【--- 粘贴你的 Markdown 草稿或章节内容 ---】\n\n润色要求：\n1) 结论先行：每个章节开头先给 1 句总结判断（↑↓持平/超预期/低于预期 …）\n2) 数字全部千分位格式化；同比/环比统一为「+12.3%」「-5.4%」；金额统一「人民币 X 亿元」\n3) 长句拆分，段落每段 ≤ 3 行\n4) 标题层级保持原 H2/H3 不变\n5) 删除口水话（"我们发现""可以看到"），直接陈述事实\n6) 全文用专业书面中文，无 emoji、无感叹号\n\n润色后直接输出 Markdown：',
+      '请为我生成一份【报告主题】的分析报告。\n\n报告周期：2026 Q2（可修改）\n重点维度：\n- 维度 1（例：绿色信贷规模）\n- 维度 2（例：对公 vs 零售对比）\n\n输出要求：\n1. 每个指标后注明口径\n2. 结尾给出 3 条可落地的业务建议',
   },
 ]
 
-const props = defineProps<{
-  plan: PlanResponse | null
-  task: Task | null
-  tasks: Task[]
-}>()
+const EXAMPLES = [
+  '生成 2026 年一季度公司金融经营分析报告，重点关注绿色信贷',
+  '快捷支付业务监测报告该包含哪些章节？',
+  '净息差怎么算？',
+]
 
-const route = useRoute()
-const router = useRouter()
-const conversationStore = useConversationStore()
+const store = useConversationStore()
 
 const inputValue = ref('')
 const messagesContainer = ref<HTMLElement | null>(null)
 const inputRef = ref<HTMLTextAreaElement | null>(null)
-const composerRef = ref<HTMLDivElement | null>(null)
+const attachments = ref<LocalAttachment[]>([])
 
-const submitFailed = ref(false)
-const submitErrorMessage = ref('')
-const isReportSubmitting = ref(false)
-let submitFailedHideTimer: ReturnType<typeof setTimeout> | null = null
+/* ── 消息渲染 ── */
 
-function showSubmitFailedBanner(message = '提交失败，请稍后重试') {
-  submitFailed.value = true
-  submitErrorMessage.value = message
-  if (submitFailedHideTimer) clearTimeout(submitFailedHideTimer)
-  submitFailedHideTimer = setTimeout(() => {
-    submitFailed.value = false
-    submitFailedHideTimer = null
-  }, 4200)
-}
+const messages = computed(() => store.messages)
 
-function dismissSubmitFailed() {
-  submitFailed.value = false
-  submitErrorMessage.value = ''
-  if (submitFailedHideTimer) {
-    clearTimeout(submitFailedHideTimer)
-    submitFailedHideTimer = null
+/** Chapter state straight from the session, driving the live generation flow. */
+const liveProgress = computed(() => {
+  const session = store.reportSession
+  const planned = session?.plan?.chapters
+  if (!planned?.length) return null
+  const drafts = session?.chapter_drafts ?? {}
+  const waiting = new Set(
+    (session?.pending_questions ?? []).map((question) => question.chapter_id).filter(Boolean),
+  )
+  return planned.map((chapter) => {
+    const draft = drafts[chapter.section_id]
+    const status = draft
+      ? 'completed'
+      : waiting.has(chapter.section_id)
+        ? 'waiting_user'
+        : session?.current_chapter_id === chapter.section_id
+          ? 'running'
+          : 'pending'
+    return {
+      section_id: chapter.section_id,
+      title: chapter.title,
+      completed: Boolean(draft),
+      status,
+      content: draft?.content,
+    } as const
+  })
+})
+
+/** Questions still open, so the card knows whether it is editable. */
+const pendingQuestionIds = computed(
+  () => (store.reportSession?.pending_questions ?? []).map((item) => item.question_id),
+)
+
+/** How each question was settled, for the read-only view after submission. */
+const resolvedQuestions = computed(() =>
+  Object.fromEntries(
+    (store.reportSession?.resolved_questions ?? []).map((item) => [item.question_id, item]),
+  ),
+)
+
+/** Question cards already submitted in this session, by the message they belong to.
+ *
+ * The POST returns as soon as the turn is stored and the run continues in the
+ * background, so the button would re-enable while the backend is still working
+ * and a second click would hit questions that are already consumed. A card is
+ * answered exactly once, so latch it locally instead of waiting for the poll.
+ */
+const submittedQuestions = ref(new Set<string>())
+
+async function submitResolutions(messageId: string, resolutions: QuestionResolutionInput[]) {
+  if (submittedQuestions.value.has(messageId)) return
+  submittedQuestions.value = new Set(submittedQuestions.value).add(messageId)
+  const dropped = resolutions.filter((item) => item.action === 'drop').length
+  const supplied = resolutions.length - dropped
+  const sent = await store.sendMessage({
+    text: `已处理本章 ${resolutions.length} 个待补充项：补充 ${supplied} 项，删除 ${dropped} 项`,
+    resolutions,
+  })
+  if (!sent) {
+    const next = new Set(submittedQuestions.value)
+    next.delete(messageId)
+    submittedQuestions.value = next
+    return
   }
+  await nextTick(() => scrollToBottom())
 }
+
+/** Only the newest progress turn renders.
+ *
+ * A run that pauses for data emits one progress message per resumption, each
+ * carrying the full chapter list, so rendering them all repeats the same
+ * timeline several times over. The newest one subsumes the rest, which keeps
+ * planning → writing → questions → download reading as a single flow.
+ */
+function isLatestProgress(message: Message, index: number): boolean {
+  return message.kind === 'progress'
+    && !messages.value.slice(index + 1).some((item) => item.kind === 'progress')
+}
+
+/** 建议 chip 只出现在最新一条、且仍待确认的计划上：历史版本和已开工的计划都只读。 */
+function isSuggestablePlan(message: Message, index: number): boolean {
+  if (message.kind !== 'plan') return false
+  if (store.reportSession?.plan?.status !== 'awaiting_confirmation') return false
+  const later = messages.value.slice(index + 1)
+  return !later.some((item) => item.kind === 'plan') && !store.isAwaitingAssistant
+}
+
+/** What the backend is busy with, so the waiting state is never a blank spinner. */
+const thinkingLabel = computed(() => {
+  const session = store.reportSession
+  const last = messages.value[messages.value.length - 1]
+  if (session?.status === 'running') {
+    const chapters = session.plan?.chapters ?? []
+    const done = Object.keys(session.chapter_drafts ?? {}).length
+    return chapters.length
+      ? `正在生成章节 ${Math.min(done + 1, chapters.length)}/${chapters.length}…`
+      : '正在生成章节…'
+  }
+  if (last?.role === 'user') {
+    if (last.attachments.length) return '正在解析模板与数据，规划章节…'
+    // The backend tags a resolution turn with its payload, so the wait after
+    // answering a supplement request says so instead of a blank "thinking".
+    if (Array.isArray(last.payload?.resolutions)) return '正在记录补充项，继续写这一章…'
+    if (session?.plan?.status === 'awaiting_confirmation') {
+      return /确认/.test(last.content) ? '正在确认计划，准备生成…' : '正在修改报告计划…'
+    }
+  }
+  return '思考中…'
+})
+
+function applySuggestion(text: string) {
+  inputValue.value = text
+  nextTick(() => {
+    autoGrow()
+    inputRef.value?.focus()
+  })
+}
+
+function pickExample(text: string) {
+  applySuggestion(text)
+}
+
+/* ── slash 菜单 ── */
 
 const slashVisible = ref(false)
 const slashQuery = ref('')
 const slashStartPos = ref(-1)
 const slashActiveIndex = ref(0)
+let slashHideTimer: ReturnType<typeof setTimeout> | null = null
 
 const filteredSlashItems = computed<SlashCommandItem[]>(() => {
   const q = slashQuery.value.trim().toLowerCase()
@@ -110,8 +194,6 @@ const filteredSlashItems = computed<SlashCommandItem[]>(() => {
     (c) => c.title.toLowerCase().includes(q) || c.description.toLowerCase().includes(q),
   )
 })
-
-let slashHideTimer: ReturnType<typeof setTimeout> | null = null
 
 function clearSlashHideTimer() {
   if (slashHideTimer) {
@@ -134,8 +216,7 @@ function handleInputChange() {
   const caret = el.selectionStart ?? text.length
   const before = text.slice(0, caret)
   const lastSlash = before.lastIndexOf('/')
-  const isSlashAtStart =
-    lastSlash === 0 || (lastSlash > 0 && /\s/.test(before.charAt(lastSlash - 1)))
+  const isSlashAtStart = lastSlash === 0 || (lastSlash > 0 && /\s/.test(before.charAt(lastSlash - 1)))
 
   if (lastSlash === -1 || !isSlashAtStart) {
     if (slashVisible.value) hideSlashMenu()
@@ -149,13 +230,11 @@ function handleInputChange() {
   if (!slashVisible.value) {
     slashVisible.value = true
     slashStartPos.value = lastSlash
-    slashQuery.value = query
     slashActiveIndex.value = 0
-  } else {
-    slashQuery.value = query
-    if (slashActiveIndex.value >= filteredSlashItems.value.length) {
-      slashActiveIndex.value = Math.max(0, filteredSlashItems.value.length - 1)
-    }
+  }
+  slashQuery.value = query
+  if (slashActiveIndex.value >= filteredSlashItems.value.length) {
+    slashActiveIndex.value = Math.max(0, filteredSlashItems.value.length - 1)
   }
 }
 
@@ -166,16 +245,13 @@ function pickSlashItem(item: SlashCommandItem) {
   const start = slashStartPos.value >= 0 ? slashStartPos.value : caret
   const before = inputValue.value.slice(0, start)
   const after = inputValue.value.slice(caret)
-  const nextText = before + item.template + after
-  inputValue.value = nextText
+  inputValue.value = before + item.template + after
   hideSlashMenu()
   nextTick(() => {
     autoGrow()
-    if (inputRef.value) {
-      const insertEnd = before.length + item.template.length
-      inputRef.value.focus()
-      inputRef.value.setSelectionRange(insertEnd, insertEnd)
-    }
+    const insertEnd = before.length + item.template.length
+    inputRef.value?.focus()
+    inputRef.value?.setSelectionRange(insertEnd, insertEnd)
   })
 }
 
@@ -184,361 +260,8 @@ function handleComposerBlur() {
   slashHideTimer = setTimeout(() => hideSlashMenu(), 160)
 }
 
-const expandedTasks = ref<Set<string>>(new Set())
-const reportPollers = new Map<string, ReturnType<typeof window.setInterval>>()
-const autoExpandedReportTasks = new Set<string>()
+/* ── 附件 ── */
 
-type ReportChapterProgress = {
-  chapter_id: string
-  section_id: string
-  title: string
-  completed: boolean
-  content?: string
-}
-
-const { getStream, handleSSEStreamingEvent, handleSSEStreamingCompleted, handleSSEStreamingFailed, cleanup } = useAllTaskStreams()
-
-let unsubscribeStreaming: (() => void) | null = null
-
-onMounted(() => {
-  unsubscribeStreaming = sseClient.on('report.streaming', (event) => {
-    const taskId = event.task_id
-    const data = event.data as { content_delta?: string } | undefined
-    if (taskId && data?.content_delta) {
-      handleSSEStreamingEvent(taskId, data.content_delta)
-    }
-  })
-
-  sseClient.on('text.chunk', (event) => {
-    const taskId = event.task_id
-    const data = event.data as { delta?: string } | undefined
-    if (taskId && data?.delta) {
-      handleSSEStreamingEvent(taskId, data.delta)
-    }
-  })
-
-  sseClient.on('section.completed', (event) => {
-    const taskId = event.task_id
-    if (taskId) {
-      handleSSEStreamingCompleted(taskId)
-    }
-  })
-
-  sseClient.on('report.completed', (event) => {
-    const taskId = event.task_id
-    if (taskId) {
-      handleSSEStreamingCompleted(taskId)
-      cleanup(taskId)
-    }
-  })
-
-  sseClient.on('task.failed', (event) => {
-    const taskId = event.task_id
-    if (taskId) {
-      handleSSEStreamingFailed(taskId)
-      cleanup(taskId)
-    }
-  })
-
-  sseClient.on('task.cancelled', (event) => {
-    const taskId = event.task_id
-    if (taskId) {
-      handleSSEStreamingFailed(taskId)
-      cleanup(taskId)
-    }
-  })
-
-  sseClient.on('task.completed', (event) => {
-    const taskId = event.task_id
-    if (taskId) {
-      handleSSEStreamingCompleted(taskId)
-      cleanup(taskId)
-    }
-  })
-
-  nextTick(() => inputRef.value?.focus())
-  for (const task of props.tasks) {
-    if (task.report_session && !['awaiting_confirmation', 'completed', 'failed', 'cancelled'].includes(task.report_session.status)) {
-      autoExpandedReportTasks.add(task.id)
-      expandedTasks.value.add(task.id)
-      startReportPolling(task.id, task.report_session.session_id)
-    }
-  }
-})
-
-watch(() => route.params.sessionId, () => {
-  nextTick(() => {
-    inputRef.value?.focus()
-    inputValue.value = ''
-  })
-}, { flush: 'post' })
-
-onUnmounted(() => {
-  if (unsubscribeStreaming) {
-    unsubscribeStreaming()
-  }
-  reportPollers.forEach((timer) => window.clearInterval(timer))
-  reportPollers.clear()
-})
-
-function reportStatusText(status?: string): string {
-  const map: Record<string, string> = {
-    created: '已接收', awaiting_confirmation: '待确认计划', running: '生成中', waiting_user: '等待补充信息', completed: '报告已完成', failed: '生成失败', cancelled: '已取消',
-  }
-  return map[status || ''] || '处理中'
-}
-
-function reportStepText(session?: ReportGenerationSession | null): string {
-  if (!session) return '正在准备报告内容…'
-  if (session.status === 'cancelled') return '任务已取消'
-  const stepMap: Record<string, string> = {
-    cancelled_after_backend_restart: '任务已取消',
-  }
-  return stepMap[session.current_step || ''] || session.current_step || '正在准备报告内容…'
-}
-
-function reportChapters(session?: ReportGenerationSession | null): ReportChapterProgress[] {
-  if (!session) return []
-  const drafts = session.chapter_drafts || {}
-  const sections = session.plan?.chapters?.length
-    ? session.plan.chapters
-    : (session.template_snapshot?.sections || [])
-  const order = session.plan?.assembly_order?.length
-    ? session.plan.assembly_order
-    : sections.map((section) => section.section_id)
-  const sectionById = new Map<string, { section_id: string; title: string }>(sections.map((section) => [section.section_id, section]))
-  const ids = [...new Set([...order, ...Object.keys(drafts)])]
-
-  return ids
-    .map((sectionId): ReportChapterProgress => {
-      const draft = drafts[sectionId]
-      const section = sectionById.get(sectionId)
-      return {
-        chapter_id: draft?.chapter_id || `chapter_${sectionId}`,
-        section_id: sectionId,
-        title: draft?.title || section?.title || sectionId,
-        completed: Boolean(draft && draft.completed !== false),
-        content: draft?.content,
-      }
-    })
-    .sort((a, b) => {
-      const orderA = order.indexOf(a.section_id)
-      const orderB = order.indexOf(b.section_id)
-      return (orderA === -1 ? Number.MAX_SAFE_INTEGER : orderA) - (orderB === -1 ? Number.MAX_SAFE_INTEGER : orderB)
-    })
-}
-
-function completedReportChapters(session?: ReportGenerationSession | null): ReportChapterProgress[] {
-  return reportChapters(session).filter((chapter) => chapter.completed && Boolean(chapter.content?.trim()))
-}
-
-function reportProgressLabel(session?: ReportGenerationSession | null): string {
-  const chapters = reportChapters(session)
-  if (chapters.length === 0) return '正在准备章节…'
-  const completed = chapters.filter((chapter) => chapter.completed).length
-  return `章节进度 ${completed}/${chapters.length}`
-}
-
-function openReportPlan(sessionId: string) {
-  void router.push({ name: 'report-detail', params: { sessionId } })
-}
-
-function startReportPolling(taskId: string, sessionId: string) {
-  if (reportPollers.has(taskId)) return
-  const poll = async () => {
-    const result = await reportApi.getSession(sessionId)
-    if (!result.success || !result.data) {
-      // 报告 session 目前由后端内存仓库存储；后端重启后，刷新页面恢复的旧任务
-      // 会得到 404。此时必须停止轮询，否则每 2 秒会重复刷同一条 404 日志。
-      const isNotFound = result.error?.code === 'REQUEST_FAILED' && (
-        /404/.test(result.error.message) ||
-        /not found|不存在|未找到|session.*not/i.test(result.error.message)
-      )
-      if (isNotFound) {
-        const task = conversationStore.tasks.find((t) => t.id === taskId)
-        if (task) {
-          conversationStore.setTask({
-            ...task,
-            status: 'failed',
-            error: '报告任务已失效，请重新提交生成',
-            report_session: task.report_session ? {
-              ...task.report_session,
-              status: 'failed',
-              error: '后端重启后报告 session 已失效，请重新提交生成',
-            } : task.report_session,
-            updated_at: new Date().toISOString(),
-          })
-        }
-        const timer = reportPollers.get(taskId)
-        if (timer) window.clearInterval(timer)
-        reportPollers.delete(taskId)
-      }
-      return
-    }
-    const session = result.data
-    const task = conversationStore.tasks.find((t) => t.id === taskId)
-    if (!task) return
-    const status = session.status === 'completed' ? 'completed'
-      : session.status === 'failed' ? 'failed'
-      : session.status === 'cancelled' ? 'cancelled'
-      : session.status === 'waiting_user' ? 'waiting_user'
-      : 'running'
-    const assembled = session.assembled_report
-    conversationStore.setTask({
-      ...task,
-      status,
-      error: session.error || null,
-      report_session: session,
-      result: assembled ? { summary: [assembled.executive_summary, ...(assembled.chapters || []).map((c) => c.content)].filter(Boolean).join('\n\n') } : task.result,
-      updated_at: session.updated_at,
-    })
-    if (['awaiting_confirmation', 'completed', 'failed', 'cancelled'].includes(session.status)) {
-      const timer = reportPollers.get(taskId)
-      if (timer) window.clearInterval(timer)
-      reportPollers.delete(taskId)
-    }
-  }
-  void poll()
-  reportPollers.set(taskId, window.setInterval(poll, 2000))
-}
-
-function toggleCollapse(taskId: string, event?: MouseEvent) {
-  // 点击 badge 时不触发展开/收起
-  if (event) {
-    const target = event.target as HTMLElement
-    if (target.closest('.thought-badge')) return
-  }
-  if (expandedTasks.value.has(taskId)) {
-    expandedTasks.value.delete(taskId)
-  } else {
-    expandedTasks.value.add(taskId)
-  }
-}
-
-function isExpanded(taskId: string): boolean {
-  return expandedTasks.value.has(taskId)
-}
-
-// ── 已完成章节整体收起 ──
-const collapsedChapters = ref<Set<string>>(new Set())
-
-function toggleChapters(taskId: string) {
-  if (collapsedChapters.value.has(taskId)) {
-    collapsedChapters.value.delete(taskId)
-  } else {
-    collapsedChapters.value.add(taskId)
-  }
-}
-
-function isChaptersCollapsed(taskId: string): boolean {
-  return collapsedChapters.value.has(taskId)
-}
-
-// ── waiting_user 澄清弹窗 ──
-const waitingDialogTaskId = ref<string | null>(null)
-const waitingDialogTab = ref<'manual' | 'sql'>('manual')
-const waitingDialogAnswer = ref('')
-const waitingDialogSql = ref('')
-const waitingDialogSubmitting = ref(false)
-const waitingDialogError = ref<string | null>(null)
-const waitingDismissedTaskIds = ref<Set<string>>(new Set())
-
-function openWaitingDialog(taskId: string) {
-  waitingDialogTaskId.value = taskId
-  waitingDialogTab.value = 'manual'
-  waitingDialogAnswer.value = ''
-  waitingDialogSql.value = ''
-  waitingDialogError.value = null
-  waitingDismissedTaskIds.value.delete(taskId)
-}
-
-function closeWaitingDialog() {
-  if (waitingDialogTaskId.value) {
-    waitingDismissedTaskIds.value.add(waitingDialogTaskId.value)
-  }
-  waitingDialogTaskId.value = null
-  waitingDialogAnswer.value = ''
-  waitingDialogSql.value = ''
-  waitingDialogError.value = null
-}
-
-const currentWaitingTask = computed(() => {
-  if (!waitingDialogTaskId.value) return null
-  return conversationStore.tasks.find((t) => t.id === waitingDialogTaskId.value) || null
-})
-
-const currentWaitingQuestion = computed<UserQuestion | null>(() => {
-  const task = currentWaitingTask.value
-  if (!task?.report_session?.pending_questions?.length) return null
-  return task.report_session.pending_questions.find((q) => !q.answer) || task.report_session.pending_questions[0]
-})
-
-async function submitWaitingAnswer() {
-  const task = currentWaitingTask.value
-  const question = currentWaitingQuestion.value
-  if (!task?.report_session?.session_id || !question || waitingDialogSubmitting.value) return
-  const payload = waitingDialogTab.value === 'sql'
-    ? waitingDialogSql.value.trim()
-    : waitingDialogAnswer.value.trim()
-  if (!payload) return
-  waitingDialogSubmitting.value = true
-  waitingDialogError.value = null
-  try {
-    const req: AnswerReportQuestionRequest = {
-      question_id: question.question_id,
-      answer: payload,
-      auto_resume: true,
-    }
-    await reportApi.answerQuestion(task.report_session.session_id, req)
-    closeWaitingDialog()
-    startReportPolling(task.id, task.report_session.session_id)
-  } catch (e: unknown) {
-    const msg = e instanceof Error ? e.message : '提交失败，请稍后重试'
-    waitingDialogError.value = msg
-  } finally {
-    waitingDialogSubmitting.value = false
-  }
-}
-
-// 轮询到 waiting_user 时自动弹窗
-watch(
-  () => conversationStore.tasks.filter((t) => t.status === 'waiting_user' && t.report_session),
-  (list) => {
-    const first = list[0]
-    if (first && !waitingDialogTaskId.value && !waitingDismissedTaskIds.value.has(first.id)) {
-      openWaitingDialog(first.id)
-    }
-  },
-  { immediate: true, deep: true },
-)
-
-// 路由是当前会话的最终来源；初始化阶段 Pinia 可能尚未完成 selectSession。
-const currentSessionId = computed(() =>
-  conversationStore.currentSessionId || String(route.params.sessionId || ''),
-)
-
-const orderedTasks = computed(() =>
-  [...props.tasks]
-    .filter((t) => t.conversation_id === currentSessionId.value)
-    .sort((a, b) => {
-      const ta = a.created_at ? new Date(a.created_at).getTime() : 0
-      const tb = b.created_at ? new Date(b.created_at).getTime() : 0
-      return ta - tb
-    })
-)
-
-const examples = [
-  '生成 2026 年一季度公司金融经营分析报告，重点关注绿色信贷',
-  '快捷支付业务监测报告该包含哪些章节？',
-  '净息差怎么算？',
-]
-
-const composerPlaceholder = computed(() => {
-  return '描述你的数据分析需求，AI 将自动规划执行步骤'
-})
-
-/* ── 附件上传：+ 按钮（Word / PDF / Excel） ── */
-const attachments = ref<LocalAttachment[]>([])
 const uploadMenuVisible = ref(false)
 const activeUploadKind = ref<UploadKind | null>(null)
 const uploadInputRef = ref<HTMLInputElement | null>(null)
@@ -551,66 +274,56 @@ function clearUploadMenuHideTimer() {
   }
 }
 
-function scheduleHideUploadMenu() {
-  clearUploadMenuHideTimer()
-  uploadMenuHideTimer = window.setTimeout(() => hideUploadMenu(), 160)
-}
-
-function handlePlusBtnBlur() {
-  scheduleHideUploadMenu()
-}
-
 function hideUploadMenu() {
   uploadMenuVisible.value = false
   activeUploadKind.value = null
 }
 
-function openUploadForKind(kind: UploadKind) {
-  activeUploadKind.value = kind
-  hideUploadMenu()
-  nextTick(() => {
-    if (uploadInputRef.value) {
-      uploadInputRef.value.accept = ACCEPT_MAP[kind]
-      uploadInputRef.value.value = ''
-      uploadInputRef.value.click()
-    }
-  })
+function handlePlusBtnBlur() {
+  clearUploadMenuHideTimer()
+  uploadMenuHideTimer = window.setTimeout(() => hideUploadMenu(), 160)
 }
 
 function toggleUploadMenu() {
-  if (uploadMenuVisible.value) {
-    hideUploadMenu()
-    return
-  }
+  if (uploadMenuVisible.value) return hideUploadMenu()
   clearUploadMenuHideTimer()
   uploadMenuVisible.value = true
 }
 
-function handleFilesSelected(e: Event) {
-  const input = e.target as HTMLInputElement
-  if (!input.files || input.files.length === 0) return
-  const kind = activeUploadKind.value
-  for (let i = 0; i < input.files.length; i += 1) {
-    const f = input.files[i]
-    const detectedKind = kind ?? detectKindByFilename(f.name)
-    if (detectedKind !== 'word' && detectedKind !== 'excel') continue
-    const existingIndex = attachments.value.findIndex((a) => a.kind === detectedKind)
-    if (existingIndex >= 0) attachments.value.splice(existingIndex, 1)
-    attachments.value.push({
-      file_id: `local_${Date.now()}_${i.toString().padStart(3, '0')}`,
-      filename: f.name,
-      kind: detectedKind,
-      size: f.size,
-      file: f,
-    })
-  }
-  nextTick(() => scrollToBottom())
+function openUploadForKind(kind: UploadKind) {
+  activeUploadKind.value = kind
+  uploadMenuVisible.value = false
+  nextTick(() => {
+    if (!uploadInputRef.value) return
+    uploadInputRef.value.accept = ACCEPT_MAP[kind]
+    uploadInputRef.value.value = ''
+    uploadInputRef.value.click()
+  })
 }
 
 function detectKindByFilename(name: string): UploadKind {
   const ext = name.toLowerCase()
-  if (ext.endsWith('.xls') || ext.endsWith('.xlsx')) return 'excel'
-  return 'word'
+  return ext.endsWith('.xls') || ext.endsWith('.xlsx') ? 'excel' : 'word'
+}
+
+function handleFilesSelected(e: Event) {
+  const input = e.target as HTMLInputElement
+  if (!input.files?.length) return
+  const kind = activeUploadKind.value
+  for (let i = 0; i < input.files.length; i += 1) {
+    const file = input.files[i]
+    const detected = kind ?? detectKindByFilename(file.name)
+    const existing = attachments.value.findIndex((a) => a.kind === detected)
+    if (existing >= 0) attachments.value.splice(existing, 1)
+    attachments.value.push({
+      file_id: `local_${Date.now()}_${i}`,
+      filename: file.name,
+      kind: detected,
+      size: file.size,
+      file,
+    })
+  }
+  activeUploadKind.value = null
 }
 
 function removeAttachment(fileId: string) {
@@ -624,117 +337,67 @@ function formatFileSize(bytes: number): string {
 }
 
 function currentAcceptStr(): string {
-  const s = new Set<string>()
-  for (const v of Object.values(ACCEPT_MAP)) {
-    v.split(',').forEach((x) => s.add(x))
-  }
-  return [...s].join(',')
+  return [...new Set(Object.values(ACCEPT_MAP).flatMap((value) => value.split(',')))].join(',')
 }
 
-async function ensureConversationId(): Promise<string | null> {
-  if (currentSessionId.value) return currentSessionId.value
-  // /conversations/new 在首次渲染时会先显示输入框，初始化会话可能尚未完成。
-  // 提交时主动补齐会话，避免用户遇到“当前会话尚未准备完成”。
-  if (conversationStore.sessions.length > 0) {
-    await conversationStore.selectSession(conversationStore.sessions[0].id)
-  } else {
-    await conversationStore.createSession('新会话')
-  }
-  return currentSessionId.value || conversationStore.currentSessionId || null
-}
-
-watch([() => props.tasks], async () => {
-  for (const task of props.tasks) {
-     if (task.report_session && !['awaiting_confirmation', 'completed', 'failed', 'cancelled'].includes(task.report_session.status)) {
-      if (!autoExpandedReportTasks.has(task.id)) {
-        autoExpandedReportTasks.add(task.id)
-        expandedTasks.value.add(task.id)
-      }
-      startReportPolling(task.id, task.report_session.session_id)
-    }
-  }
-  await nextTick()
-  scrollToBottom()
-}, { deep: true })
+/* ── 发送 ── */
 
 async function handleSend() {
-  const content = inputValue.value.trim()
-  if (!content || isReportSubmitting.value) return
-  const templateAttachment = attachments.value.find((a) => a.kind === 'word')
-  const dataAttachment = attachments.value.find((a) => a.kind === 'excel')
-  if (!templateAttachment || !dataAttachment) {
-    showSubmitFailedBanner('请通过“+”同时上传一个报告模板和一个 Excel 文件，再输入生成指令')
-    return
-  }
-  const conversationId = await ensureConversationId()
-  if (!conversationId) {
-    showSubmitFailedBanner('当前会话尚未准备完成，请稍后重试')
-    return
-  }
-
-  isReportSubmitting.value = true
-  const result = await reportApi.intakeWorkflow(
-    templateAttachment.file,
-    dataAttachment.file,
-    content,
-  )
-  isReportSubmitting.value = false
-  if (!result.success || !result.data?.session?.session_id) {
-    showSubmitFailedBanner(result.error?.message || '报告生成请求提交失败，请检查文件和提示词')
-    return
-  }
-  attachments.value = []
+  const text = inputValue.value.trim()
+  if (!text || store.isSending) return
+  const sent = await store.sendMessage({
+    text,
+    templateFile: attachments.value.find((a) => a.kind === 'word')?.file,
+    dataFile: attachments.value.find((a) => a.kind === 'excel')?.file,
+  })
+  if (!sent) return
   inputValue.value = ''
-  await nextTick(() => autoGrow())
-  const reportSession = result.data.session
-  const now = new Date().toISOString()
-  const task: Task = {
-    id: reportSession.session_id,
-    conversation_id: conversationId,
-    turn_id: `turn_${reportSession.session_id}`,
-    prompt: content,
-    status: 'running',
-    attachments: [templateAttachment.filename, dataAttachment.filename],
-    plan: null,
-    result: null,
-    error: null,
-    created_at: now,
-    updated_at: now,
-    report_session: reportSession,
-  }
-  conversationStore.setTask(task)
-  conversationStore.updateConversationTitle(conversationId, content)
-  startReportPolling(task.id, reportSession.session_id)
-  autoExpandedReportTasks.add(task.id)
-  expandedTasks.value.add(task.id)
+  attachments.value = []
+  await nextTick(() => {
+    autoGrow()
+    scrollToBottom()
+  })
+}
+
+/** What the resume bar says: how far the run got, and why it stopped. */
+const resumeText = computed(() => {
+  const session = store.reportSession
+  if (!session) return ''
+  const done = Object.keys(session.chapter_drafts ?? {}).length
+  const total = session.plan?.sections?.length ?? 0
+  const progress = total ? `已完成 ${done}/${total} 章` : `已完成 ${done} 章`
+  return session.status === 'cancelled'
+    ? `生成已停止，${progress}，进度已保留。`
+    : `生成中断了，${progress}，进度已保留。`
+})
+
+async function handleStop() {
+  if (store.isCancelling) return
+  await store.cancelGeneration()
   await nextTick(() => scrollToBottom())
 }
 
-function scrollToBottom() {
-  if (messagesContainer.value) {
-    messagesContainer.value.scrollTop = messagesContainer.value.scrollHeight
-  }
+/** Resume a run that was stopped or that failed, picking up at its last chapter. */
+async function handleResume() {
+  if (store.isSending) return
+  const sent = await store.sendMessage({ text: '继续' })
+  if (!sent) return
+  await nextTick(() => scrollToBottom())
 }
 
 function handleKeydown(event: KeyboardEvent) {
   if (slashVisible.value) {
     const items = filteredSlashItems.value
-    if (event.key === 'ArrowDown') {
+    if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
       event.preventDefault()
       if (items.length === 0) return
-      slashActiveIndex.value = (slashActiveIndex.value + 1) % items.length
+      const step = event.key === 'ArrowDown' ? 1 : items.length - 1
+      slashActiveIndex.value = (slashActiveIndex.value + step) % items.length
       return
     }
-    if (event.key === 'ArrowUp') {
+    if (event.key === 'Enter' || event.key === 'Tab') {
       event.preventDefault()
-      if (items.length === 0) return
-      slashActiveIndex.value = (slashActiveIndex.value - 1 + items.length) % items.length
-      return
-    }
-    if (event.key === 'Enter' && !event.shiftKey && !event.isComposing) {
-      event.preventDefault()
-      const item = items[slashActiveIndex.value]
-      if (item) pickSlashItem(item)
+      if (items[slashActiveIndex.value]) pickSlashItem(items[slashActiveIndex.value])
       return
     }
     if (event.key === 'Escape') {
@@ -742,31 +405,10 @@ function handleKeydown(event: KeyboardEvent) {
       hideSlashMenu()
       return
     }
-    if (event.key === 'Tab') {
-      const item = items[slashActiveIndex.value]
-      if (item) {
-        event.preventDefault()
-        pickSlashItem(item)
-        return
-      }
-    }
-  }
-  if (uploadMenuVisible.value) {
-    if (event.key === 'Escape') {
-      event.preventDefault()
-      hideUploadMenu()
-      return
-    }
-  }
-  if (event.key === 'Escape') {
-    if (inputRef.value) {
-      inputRef.value.blur()
-    }
-    return
   }
   if (event.key === 'Enter' && !event.shiftKey && !event.isComposing) {
     event.preventDefault()
-    handleSend()
+    void handleSend()
   }
 }
 
@@ -774,335 +416,155 @@ function autoGrow() {
   const el = inputRef.value
   if (!el) return
   el.style.height = 'auto'
-  el.style.height = `${Math.min(el.scrollHeight, 160)}px`
+  el.style.height = `${Math.min(el.scrollHeight, 220)}px`
 }
 
-function taskStatusText(status: string): string {
-  const map: Record<string, string> = {
-    created: '等待开始',
-    planning: '规划中',
-    running: '执行中',
-    needs_data: '等待数据',
-    completed: '已完成',
-    failed: '执行失败',
-    cancelled: '已中止',
-  }
-  return map[status] ?? status
-}
-
-function hasResultData(result: TaskResult | null): boolean {
-  if (!result) return false
-  return Object.keys(result).length > 0
-}
-
-function formatResultValue(value: unknown): string {
-  if (value === null || value === undefined) return '-'
-  if (typeof value === 'number') return value.toLocaleString('zh-CN')
-  if (typeof value === 'string') return value
-  if (typeof value === 'boolean') return value ? '是' : '否'
-  return JSON.stringify(value)
-}
-
-async function abortTask(taskId: string) {
-  try {
-    await taskApi.cancelTask(taskId)
-  } catch {
-    // ignore network errors
-  }
-}
-
-function isExpandableSection(key: string): boolean {
-  const skip = ['summary', 'statistics', 'overview', 'total', 'report_id', 'title', 'cited_metrics', 'cited_sections', 'sub_type', 'body_markdown', 'followup_suggestions']
-  return !skip.includes(key) && typeof key === 'string'
-}
-
-function getFollowupSuggestions(task: Task): string[] {
-  const r = task.result as TaskResult | null
-  const raw = r?.followup_suggestions ?? []
-  if (Array.isArray(raw)) {
-    return raw
-      .map(x => (typeof x === 'string' ? x : (x && typeof x === 'object' && 'text' in x ? String((x as Record<string, unknown>).text) : '')))
-      .filter(x => x && x.trim().length > 0)
-  }
-  return []
-}
-
-function handleFollowupClick(question: string) {
-  if (!question || !question.trim()) return
-  inputValue.value = question.trim()
-  nextTick(() => {
-    autoGrow()
-    if (inputRef.value) {
-      inputRef.value.focus()
-      const len = inputRef.value.value.length
-      inputRef.value.setSelectionRange(len, len)
-    }
+function scrollToBottom() {
+  const el = messagesContainer.value
+  if (!el) return
+  el.scrollTop = el.scrollHeight
+  // Plan and report cards lay out after the first paint, growing the
+  // scroll height; a second pass keeps the newest turn actually in view.
+  requestAnimationFrame(() => {
+    if (messagesContainer.value) messagesContainer.value.scrollTop = messagesContainer.value.scrollHeight
   })
 }
 
-function pickExampleChip(text: string) {
-  if (!text || !text.trim()) return
-  inputValue.value = text.trim()
+onMounted(() => {
   nextTick(() => {
-    autoGrow()
-    if (inputRef.value) {
-      inputRef.value.focus()
-      const len = inputRef.value.value.length
-      inputRef.value.setSelectionRange(len, len)
-    }
+    inputRef.value?.focus()
+    scrollToBottom()
   })
-}
+})
+
+onUnmounted(() => {
+  clearSlashHideTimer()
+  clearUploadMenuHideTimer()
+})
+
+watch(
+  () => store.messages.length,
+  () => nextTick(() => scrollToBottom()),
+  { flush: 'post' },
+)
+
+watch(
+  () => store.currentConversationId,
+  () => {
+    inputValue.value = ''
+    attachments.value = []
+    nextTick(() => inputRef.value?.focus())
+  },
+)
 </script>
 
 <template>
   <div class="chat-panel">
-    <div
-      v-if="submitFailed"
-      class="submit-failed-banner"
-      role="alert"
-    >
-      <span class="submit-failed-text">{{ submitErrorMessage }}</span>
-      <button type="button" class="submit-failed-close" aria-label="关闭提示" @click="dismissSubmitFailed">×</button>
+    <div v-if="store.error" class="submit-failed-banner" role="alert">
+      <span class="submit-failed-text">{{ store.error }}</span>
+      <button type="button" class="submit-failed-close" aria-label="关闭提示" @click="store.clearError()">×</button>
     </div>
+
     <div ref="messagesContainer" class="chat-scroll">
       <div class="chat-inner">
-        <!-- 空态：欢迎语 -->
-        <div v-if="orderedTasks.length === 0" class="welcome">
+        <div v-if="messages.length === 0" class="welcome">
           <h1 class="welcome-title">智能数据分析助手</h1>
-          <p class="welcome-subtitle">描述你的需求，AI 将自动规划执行步骤并生成分析报告</p>
+          <p class="welcome-subtitle">上传报告模板和数据，用对话完成规划、修改与生成</p>
           <div class="welcome-chips">
-            <button
-              v-for="ex in examples"
-              :key="ex"
-              type="button"
-              class="welcome-chip"
-              @click="pickExampleChip(ex)"
-            >{{ ex }}</button>
+            <button v-for="ex in EXAMPLES" :key="ex" type="button" class="welcome-chip" @click="pickExample(ex)">
+              {{ ex }}
+            </button>
           </div>
         </div>
 
-        <!-- 任务历史 -->
-        <div v-for="task in orderedTasks" :key="task.id" class="task-flow">
-          <!-- 用户输入气泡 -->
-          <div class="msg-row is-user">
+        <template v-for="(message, index) in messages" :key="message.message_id">
+          <div v-if="message.role === 'user'" class="msg-row is-user">
             <div class="bubble user-bubble">
-              <div class="user-text">{{ task.prompt }}</div>
-              <div v-if="task.attachments?.length" class="message-attachments">
-                <div v-for="file in task.attachments" :key="file" class="message-attachment">
+              <div class="user-text">{{ message.content }}</div>
+              <div v-if="message.attachments.length" class="message-attachments">
+                <div v-for="file in message.attachments" :key="file.filename" class="message-attachment">
                   <span class="message-attachment-icon">📎</span>
-                  <span class="message-attachment-name" :title="file">{{ file }}</span>
+                  <span class="message-attachment-name" :title="file.filename">{{ file.filename }}</span>
                 </div>
               </div>
             </div>
           </div>
 
-          <!-- 助手回复 -->
-          <div class="msg-row is-assistant">
+          <div v-else class="msg-row is-assistant">
             <div class="assistant-stack">
-              <div v-if="task.report_session" class="report-progress-card">
-                <button
-                  type="button"
-                  class="thought-head"
-                  :aria-expanded="isExpanded(task.id)"
-                  :aria-controls="`report-progress-${task.id}`"
-                  @click="toggleCollapse(task.id)"
-                >
-                  <span class="ac-bar" aria-hidden="true" />
-                  <span class="ac-title">报告生成过程</span>
-                  <span class="report-progress-count">{{ reportProgressLabel(task.report_session) }}</span>
-                  <span class="thought-badge" :class="task.report_session.status">{{ reportStatusText(task.report_session.status) }}</span>
-                  <svg class="thought-chevron" :class="{ open: isExpanded(task.id) }" viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="6 9 12 15 18 9" /></svg>
-                </button>
-                 <div v-if="isExpanded(task.id)" :id="`report-progress-${task.id}`" class="thought-body report-progress-body">
-                    <div class="report-progress-summary">{{ task.report_session.current_step || '正在准备报告内容…' }}</div>
-                    <div v-if="task.report_session.status === 'awaiting_confirmation'" class="report-plan-confirm-row">
-                      <span>报告计划已生成，请确认章节和指标后继续。</span>
-                      <button type="button" class="report-plan-confirm-btn" @click="openReportPlan(task.report_session.session_id)">打开计划</button>
-                    </div>
-                    <div v-if="reportChapters(task.report_session).length" class="report-chapter-progress">
-                    <div v-for="chapter in reportChapters(task.report_session)" :key="chapter.chapter_id" class="report-chapter-item">
-                      <span class="report-chapter-dot" :class="{ done: chapter.completed, active: chapter.section_id === task.report_session.current_chapter_id && !chapter.completed }">{{ chapter.completed ? '✓' : '·' }}</span>
-                      <div class="report-chapter-main">
-                        <div class="report-chapter-title">{{ chapter.title }}</div>
-                        <div class="report-chapter-state">
-                          {{ chapter.completed ? '章节已完成' : chapter.section_id === task.report_session.current_chapter_id ? '正在生成…' : '等待生成' }}
-                        </div>
-                      </div>
-                    </div>
-                  </div>
-                  <div v-else class="report-chapter-empty">正在解析模板并创建章节计划…</div>
-                </div>
-              </div>
-
-              <div v-if="completedReportChapters(task.report_session).length" class="report-chapter-results">
-                <div class="chapter-results-head">
-                  <span class="chapter-results-label">已完成章节（{{ completedReportChapters(task.report_session).length }}）</span>
-                  <button type="button" class="toggle-chapters-btn" @click="toggleChapters(task.id)">
-                    {{ isChaptersCollapsed(task.id) ? '展开章节' : '收起章节' }}
-                  </button>
-                </div>
-                <template v-if="!isChaptersCollapsed(task.id)">
-                  <div v-for="chapter in completedReportChapters(task.report_session)" :key="`${task.id}-${chapter.chapter_id}`" class="answer-bubble report-chapter-answer">
-                    <div class="report-final-label">章节生成完成</div>
-                    <article class="report-inline md-content">
-                      <h3>{{ chapter.title }}</h3>
-                      <div v-html="renderMarkdown(chapter.content || '')" />
-                    </article>
-                  </div>
-                </template>
-              </div>
-
-              <div v-if="task.report_session?.status === 'completed' && task.report_session.assembled_report" class="answer-bubble report-answer-bubble">
-                <div class="report-final-label">报告生成完成</div>
-                <article class="report-inline md-content">
-                  <h2>{{ task.report_session.assembled_report.title }}</h2>
-                  <div v-if="task.report_session.assembled_report.executive_summary" class="report-inline-summary" v-html="renderMarkdown(task.report_session.assembled_report.executive_summary)" />
-                  <section v-for="chapter in task.report_session.assembled_report.chapters || []" :key="chapter.chapter_id" class="report-inline-section">
-                    <h3>{{ chapter.title }}</h3>
-                    <div v-html="renderMarkdown(chapter.content || '')" />
-                  </section>
-                </article>
-              </div>
-
-              <div
-                v-if="!task.report_session && (task.plan || task.status === 'created' || task.status === 'planning' || task.status === 'running')"
-                class="thought-card"
-              >
-                <button type="button" class="thought-head" @click="toggleCollapse(task.id)">
-                  <span class="ac-bar" aria-hidden="true" />
-                  <span class="ac-title">执行计划</span>
-                  <span class="thought-badge" :class="task.status">{{ taskStatusText(task.status) }}</span>
-                  <svg
-                    class="thought-chevron"
-                    :class="{ open: isExpanded(task.id) }"
-                    viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"
-                    aria-hidden="true"
-                  >
-                    <polyline points="6 9 12 15 18 9" />
-                  </svg>
-                </button>
-                <div v-if="isExpanded(task.id)" class="thought-body">
-                  <div v-if="task.plan" class="ac-goal">
-                    <div class="ac-goal-label">任务目标</div>
-                    <div class="ac-goal-text">{{ task.plan.summary }}</div>
-                  </div>
-                  <div v-else-if="task.status === 'created' || task.status === 'planning'" class="ac-goal">
-                    <div class="ac-goal-label muted flex-row">
-                      <span>正在规划执行步骤</span>
-                      <span class="loading-dots" aria-hidden="true">
-                        <span /><span /><span />
-                      </span>
-                    </div>
-                  </div>
-                  <div v-if="task.plan && task.plan.steps.length > 0" class="ac-timeline">
-                    <StepTimeline :steps="task.plan.steps" />
-                  </div>
-                </div>
-              </div>
-
-              <!-- 回答气泡（流式中 + 已完成回答 + 中止内容都走这里，无大标题，直接正文） -->
-              <div
-                v-if="
-                  !task.report_session && (
-                    (task.status === 'running' && getStream(task.id).chunks.length > 0) ||
-                    (task.status === 'completed' && (hasResultData(task.result as TaskResult) || getStream(task.id).chunks.length > 0)) ||
-                    (task.status === 'cancelled' && getStream(task.id).chunks.length > 0)
-                  )
-                "
-                class="answer-bubble"
-              >
-                <StreamContent
-                  :chunks="(
-                    getStream(task.id).chunks.length > 0
-                      ? getStream(task.id).chunks
-                      : [(task.result as TaskResult)?.summary ?? (task.plan?.steps ?? []).map((s) => s.result?.body_markdown ?? '').join('')] as string[]
-                  ).filter((c) => c)"
-                  :streaming="task.status === 'running' && getStream(task.id).isStreaming"
-                />
-
-                <!-- 报告模式的统计指标（Consult 模式一般为 null，保留兼容三栏报告） -->
-                <div v-if="(task.result as TaskResult)?.statistics" class="ac-stats">
-                  <div v-for="(value, key) in (task.result as TaskResult).statistics" :key="String(key)" class="ac-stat">
-                    <span class="ac-stat-label">{{ String(key) }}</span>
-                    <span class="ac-stat-value">{{ formatResultValue(value) }}</span>
-                  </div>
-                </div>
-
-                <!-- 「你可能还想问」Followup chips（cited_metrics/cited_sections 已移除，不渲染） -->
-                <div
-                  v-if="task.status === 'completed' && getFollowupSuggestions(task).length > 0"
-                  class="followup-wrap"
-                >
-                  <div class="followup-label">你可能还想问</div>
-                  <div class="followup-chips">
-                    <button
-                      v-for="q in getFollowupSuggestions(task)"
-                      :key="q"
-                      type="button"
-                      class="followup-chip"
-                      @click="handleFollowupClick(q)"
-                    >{{ q }}</button>
-                  </div>
-                </div>
-              </div>
-
-              <!-- 完成无结果 -->
-              <div v-if="!task.report_session && task.status === 'completed' && !hasResultData(task.result as TaskResult) && getStream(task.id).chunks.length === 0" class="answer-bubble answer-empty">
-                <div class="ac-result-text">任务已完成</div>
-              </div>
-
-              <!-- 错误卡片（失败 / 取消且有错误信息） -->
-              <div v-if="(task.status === 'failed' || (task.status === 'cancelled' && task.error)) && task.error" class="error-card">
+              <div v-if="message.kind === 'error'" class="error-card">
                 <div class="error-head">
                   <span class="ac-bar error" />
-                  <span class="ac-title">{{ task.status === 'cancelled' ? '任务已取消' : '执行失败' }}</span>
+                  <span class="ac-title">执行失败</span>
                 </div>
                 <div class="ac-body">
-                  <div class="ac-error-text">{{ task.error }}</div>
+                  <div class="ac-error-text">{{ message.content }}</div>
                 </div>
               </div>
 
-              <!-- 中止卡片（无错误信息的取消） -->
-              <div v-if="task.status === 'cancelled' && !task.error && getStream(task.id).chunks.length === 0" class="answer-bubble answer-empty">
-                <div class="ac-error-text">任务已被用户中止</div>
-              </div>
-              <div v-if="task.status === 'cancelled' && getStream(task.id).chunks.length > 0" class="cancelled-hint">
-                生成已被中止，以上为已输出的内容。
-              </div>
+              <template v-else>
+                <div class="answer-bubble">
+                  <div class="md-content" v-html="renderMarkdown(message.content)" />
+                </div>
+                <PlanCard
+                  v-if="message.kind === 'plan'"
+                  :message="message"
+                  :suggestable="isSuggestablePlan(message, index)"
+                  @suggest="applySuggestion"
+                />
+                <ProgressFlow
+                  v-else-if="message.kind === 'progress' && isLatestProgress(message, index)"
+                  :message="message"
+                  :live="liveProgress"
+                  :session-status="store.reportSession?.status"
+                />
+                <QuestionCard
+                  v-else-if="message.kind === 'question'"
+                  :message="message"
+                  :pending-ids="pendingQuestionIds"
+                  :resolved="resolvedQuestions"
+                  :submitting="store.isSending || submittedQuestions.has(message.message_id)"
+                  @submit="(items) => submitResolutions(message.message_id, items)"
+                />
+                <ReportCard v-else-if="message.kind === 'report'" :message="message" />
+              </template>
+            </div>
+          </div>
+        </template>
+
+        <div v-if="store.isAwaitingAssistant" class="msg-row is-assistant">
+          <div class="assistant-stack">
+            <div class="answer-bubble thinking-bubble">
+              <span class="loading-dots"><span /><span /><span /></span>
+              <span class="thinking-label">{{ thinkingLabel }}</span>
             </div>
           </div>
         </div>
       </div>
     </div>
 
-    <!-- 输入区 -->
-    <div ref="composerRef" class="composer" style="position: relative;">
+    <div class="composer" style="position: relative;">
+      <div v-if="store.isResumable" class="resume-bar">
+        <span class="resume-text">{{ resumeText }}</span>
+        <button type="button" class="resume-btn" :disabled="store.isSending" @click="handleResume">
+          继续生成
+        </button>
+      </div>
       <SlashCommandMenu
         v-if="slashVisible"
         :items="filteredSlashItems"
         :active-index="slashActiveIndex"
         @pick="pickSlashItem"
       />
-      <div
-        v-if="uploadMenuVisible"
-        class="upload-menu"
-      >
-        <button
-          type="button"
-          class="upload-menu-item"
-          @click="openUploadForKind('word')"
-        >
+      <div v-if="uploadMenuVisible" class="upload-menu">
+        <button type="button" class="upload-menu-item" @click="openUploadForKind('word')">
           <span class="upload-menu-icon word">W</span>
           <div class="upload-menu-meta">
             <div class="upload-menu-title">上传报告模板</div>
             <div class="upload-menu-desc">.docx / .md / .txt</div>
           </div>
         </button>
-        <button
-          type="button"
-          class="upload-menu-item"
-          @click="openUploadForKind('excel')"
-        >
+        <button type="button" class="upload-menu-item" @click="openUploadForKind('excel')">
           <span class="upload-menu-icon excel">X</span>
           <div class="upload-menu-meta">
             <div class="upload-menu-title">上传 Excel 表格</div>
@@ -1123,11 +585,11 @@ function pickExampleChip(text: string) {
           type="button"
           class="plus-btn"
           :class="{ active: uploadMenuVisible }"
+          aria-label="添加附件"
+          title="添加附件"
           @click="toggleUploadMenu"
           @focus="clearUploadMenuHideTimer()"
           @blur="handlePlusBtnBlur"
-          aria-label="添加附件"
-          title="添加附件"
         >
           <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
             <line x1="12" y1="5" x2="12" y2="19" />
@@ -1136,25 +598,13 @@ function pickExampleChip(text: string) {
         </button>
         <div class="composer-input-wrap">
           <div v-if="attachments.length > 0" class="attachment-chips">
-            <div
-              v-for="a in attachments"
-              :key="a.file_id"
-              class="attachment-chip"
-            >
-              <span class="attachment-icon" :class="a.kind">
-                {{ a.kind === 'word' ? 'W' : 'X' }}
-              </span>
+            <div v-for="a in attachments" :key="a.file_id" class="attachment-chip">
+              <span class="attachment-icon" :class="a.kind">{{ a.kind === 'word' ? 'W' : 'X' }}</span>
               <div class="attachment-meta">
                 <span class="attachment-name" :title="a.filename">{{ a.filename }}</span>
                 <span class="attachment-size">{{ formatFileSize(a.size) }} · {{ KIND_LABEL[a.kind] }}</span>
               </div>
-              <button
-                type="button"
-                class="attachment-remove"
-                aria-label="移除附件"
-                title="移除附件"
-                @click.stop="removeAttachment(a.file_id)"
-              >
+              <button type="button" class="attachment-remove" aria-label="移除附件" @click.stop="removeAttachment(a.file_id)">
                 <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
                   <line x1="18" y1="6" x2="6" y2="18" />
                   <line x1="6" y1="6" x2="18" y2="18" />
@@ -1166,7 +616,7 @@ function pickExampleChip(text: string) {
             ref="inputRef"
             v-model="inputValue"
             class="composer-input"
-            :placeholder="composerPlaceholder"
+            placeholder="描述需求、修改计划，或直接确认开始生成"
             rows="1"
             @keydown="handleKeydown"
             @input="handleInputChange(); autoGrow()"
@@ -1175,86 +625,23 @@ function pickExampleChip(text: string) {
           />
         </div>
         <button
-          class="send-btn"
-          @click="handleSend"
-          :disabled="isReportSubmitting || !inputValue.trim()"
+          v-if="store.isGenerating"
+          class="send-btn is-stop"
+          :disabled="store.isCancelling"
+          title="停止生成，已写完的章节会保留"
+          @click="handleStop"
         >
-          <span v-if="isReportSubmitting" class="spinner-small" />
-          <span v-else>生成报告</span>
+          <span v-if="store.isCancelling" class="spinner-small" />
+          <template v-else><span class="stop-glyph" />停止</template>
+        </button>
+        <button v-else class="send-btn" :disabled="store.isSending || !inputValue.trim()" @click="handleSend">
+          <span v-if="store.isSending" class="spinner-small" />
+          <span v-else>发送</span>
         </button>
       </div>
     </div>
 
-    <p class="disclaimer">
-      请勿上传或处理敏感、涉密数据。本平台内容由 AI 生成，仅供参考。
-    </p>
-
-    <!-- 澄清问题弹窗 -->
-    <Teleport to="body">
-      <div v-if="waitingDialogTaskId && currentWaitingQuestion" class="waiting-backdrop" @click.self="closeWaitingDialog">
-        <div class="waiting-dialog" role="dialog" aria-modal="true">
-          <div class="waiting-dialog-head">
-            <div class="waiting-dialog-title">需要补充信息</div>
-            <button type="button" class="waiting-dialog-close" :disabled="waitingDialogSubmitting" @click="closeWaitingDialog">×</button>
-          </div>
-          <div class="waiting-dialog-body">
-            <div class="waiting-question-text">{{ currentWaitingQuestion.content }}</div>
-            <div v-if="currentWaitingQuestion.reason" class="waiting-question-reason">{{ currentWaitingQuestion.reason }}</div>
-
-            <div class="waiting-tabs">
-              <button
-                type="button"
-                class="waiting-tab"
-                :class="{ active: waitingDialogTab === 'manual' }"
-                @click="waitingDialogTab = 'manual'"
-                :disabled="waitingDialogSubmitting"
-              >手动填值</button>
-              <button
-                type="button"
-                class="waiting-tab"
-                :class="{ active: waitingDialogTab === 'sql' }"
-                @click="waitingDialogTab = 'sql'"
-                :disabled="waitingDialogSubmitting"
-              >SQL 查询</button>
-            </div>
-
-            <div v-if="waitingDialogTab === 'manual'" class="waiting-tab-body">
-              <textarea
-                v-model="waitingDialogAnswer"
-                class="waiting-textarea"
-                placeholder="请输入需要补充的数据或说明…"
-                rows="4"
-                :disabled="waitingDialogSubmitting"
-              />
-            </div>
-            <div v-else class="waiting-tab-body">
-              <textarea
-                v-model="waitingDialogSql"
-                class="waiting-textarea waiting-sql"
-                placeholder="输入 SQL 查询语句，例如：SELECT * FROM bank_data WHERE 期间 = '2026Q1'"
-                rows="4"
-                :disabled="waitingDialogSubmitting"
-              />
-              <div class="waiting-sql-hint">提示：支持在已上传的数据源上执行 SQL 查询，查询结果会补充给模型继续生成。</div>
-            </div>
-
-            <div v-if="waitingDialogError" class="waiting-dialog-error">{{ waitingDialogError }}</div>
-          </div>
-          <div class="waiting-dialog-foot">
-            <button type="button" class="waiting-btn-cancel" :disabled="waitingDialogSubmitting" @click="closeWaitingDialog">稍后补充</button>
-            <button
-              type="button"
-              class="waiting-btn-submit"
-              :disabled="waitingDialogSubmitting || (waitingDialogTab === 'manual' ? !waitingDialogAnswer.trim() : !waitingDialogSql.trim())"
-              @click="submitWaitingAnswer"
-            >
-              <span v-if="waitingDialogSubmitting" class="spinner-small" />
-              <span v-else>提交并继续生成</span>
-            </button>
-          </div>
-        </div>
-      </div>
-    </Teleport>
+    <p class="disclaimer">请勿上传或处理敏感、涉密数据。本平台内容由 AI 生成，仅供参考。</p>
   </div>
 </template>
 
@@ -1280,12 +667,6 @@ function pickExampleChip(text: string) {
   display: flex;
   flex-direction: column;
   gap: 16px;
-}
-
-/* ── 空态 ── */
-.welcome {
-  margin-top: 6vh;
-  text-align: center;
 }
 
 .welcome-title {
@@ -1328,13 +709,6 @@ function pickExampleChip(text: string) {
   color: var(--color-primary);
 }
 
-/* ── 任务流 ── */
-.task-flow {
-  display: flex;
-  flex-direction: column;
-  gap: 12px;
-}
-
 .msg-row {
   display: flex;
 }
@@ -1347,21 +721,17 @@ function pickExampleChip(text: string) {
   justify-content: flex-start;
 }
 
-/* ── 用户气泡 ── */
 .bubble {
-  max-width: 82%;
+  max-width: 78%;
   padding: 12px 16px;
+  border-radius: 18px;
   font-size: 14px;
   line-height: 1.6;
-  border-radius: 16px;
-  word-break: break-word;
-  box-shadow: 0 1px 2px rgba(16, 42, 67, 0.06);
 }
 
 .user-bubble {
-  background: var(--gradient-primary);
-  color: #fff;
-  border-bottom-right-radius: 4px;
+  background: var(--color-bubble-user-bg);
+  color: var(--color-text-dark);
   white-space: pre-wrap;
 }
 
@@ -1375,7 +745,7 @@ function pickExampleChip(text: string) {
   gap: 6px;
   margin-top: 10px;
   padding-top: 9px;
-  border-top: 1px solid rgba(255,255,255,.28);
+  border-top: 1px solid var(--color-bubble-user-border);
 }
 
 .message-attachment {
@@ -1385,163 +755,29 @@ function pickExampleChip(text: string) {
   max-width: 220px;
   padding: 5px 8px;
   border-radius: 8px;
-  background: rgba(255,255,255,.16);
+  background: rgba(255, 255, 255, 0.55);
+  color: var(--color-text-dark);
   font-size: 12px;
 }
 
 .message-attachment-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
-/* ── 助手卡片堆叠 ── */
-.assistant-stack {
-  width: 100%;
-  display: flex;
-  flex-direction: column;
-  gap: 12px;
-}
-
-.ac-stack {
-  width: 100%;
-  display: flex;
-  flex-direction: column;
-  gap: 10px;
-}
-
-/* ── 执行计划折叠卡（保持原 ac-head 竖线+粗字样式） ── */
-.thought-card {
-  width: 100%;
-  display: flex;
-  flex-direction: column;
-}
-
-.thought-head {
-  width: 100%;
-  border: 1px solid var(--color-primary-border);
-  background: #fff;
-  border-radius: 12px;
-  padding: 14px 16px;
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 10px;
-  cursor: pointer;
-  text-align: left;
-  font-family: inherit;
-}
-
-.thought-head .ac-bar {
-  flex-shrink: 0;
-}
-
-.thought-head .ac-title {
-  flex: 1;
-}
-
-.thought-badge {
-  flex-shrink: 0;
-  font-size: 11px;
-  font-weight: 600;
-  padding: 3px 10px;
-  border-radius: var(--radius-pill);
-  background: var(--color-bg-hover, #f0ecf5);
-  color: var(--color-text-medium);
-}
-
-.thought-badge.planning,
-.thought-badge.running,
-.thought-badge.created,
-.thought-badge.awaiting_confirmation,
-.thought-badge.needs_data,
-.thought-badge.waiting_user {
-  color: var(--color-primary);
-  background: var(--color-primary-light);
-}
-
-.thought-badge.completed {
-  color: var(--color-success, #059669);
-  background: var(--color-success-bg, #ecfdf5);
-}
-
-.thought-badge.failed {
-  color: var(--color-error, #dc2626);
-  background: var(--color-error-bg, #fef2f2);
-}
-
-.thought-badge.cancelled {
-  color: var(--color-text-light);
-  background: var(--color-bg-hover, #f0ecf5);
-}
-
-.thought-badge.clickable {
-  cursor: pointer;
-  transition: opacity 0.15s;
-}
-
-.thought-badge.clickable:hover {
-  opacity: 0.75;
-}
-
-.thought-chevron {
-  flex-shrink: 0;
-  color: var(--color-text-light);
-  transition: transform 0.2s ease;
-}
-
-.thought-chevron.open {
-  transform: rotate(180deg);
-}
-
-.thought-body {
-  padding: 4px 12px 12px;
-  background: #fff;
-  border-radius: 0 0 12px 12px;
-  border: 1px solid var(--color-primary-border);
-  border-top: none;
-  margin: -1px 0 0;
-}
-
-.thought-body .ac-goal {
-  margin-top: 12px;
-}
-
-.report-progress-card { width: 100%; }
-.report-progress-body { padding: 14px 16px 16px; }
-.report-progress-summary { color: var(--color-text-medium); font-size: 13px; margin-bottom: 12px; }
-.report-progress-count { flex-shrink: 0; color: var(--color-text-light); font-size: 12px; white-space: nowrap; }
-.report-plan-confirm-row { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin: 0 0 12px; padding: 10px 12px; border: 1px solid #f5c76a; border-radius: 9px; background: #fffbf0; color: var(--color-text-medium); font-size: 12.5px; }
-.report-plan-confirm-btn { flex-shrink: 0; border: 0; border-radius: 8px; padding: 6px 11px; background: var(--color-primary); color: #fff; cursor: pointer; font: inherit; font-size: 12px; font-weight: 600; }
-.report-chapter-progress { display: flex; flex-direction: column; gap: 10px; }
-.report-chapter-item { display: flex; gap: 10px; align-items: flex-start; }
-.report-chapter-dot { width: 22px; height: 22px; border-radius: 50%; background: var(--color-bg-gray); color: var(--color-text-light); display: inline-flex; align-items: center; justify-content: center; flex-shrink: 0; font-weight: 700; }
-.report-chapter-dot.done { background: var(--color-success-bg); color: var(--color-success); }
-.report-chapter-dot.active { background: var(--color-primary-light); color: var(--color-primary); animation: pulse 1.6s infinite; }
-.report-chapter-main { min-width: 0; flex: 1; }
-.report-chapter-title { font-size: 13px; font-weight: 600; color: var(--color-text-dark); }
-.report-chapter-state { margin-top: 3px; font-size: 12px; color: var(--color-text-light); }
-.report-chapter-empty { color: var(--color-text-light); font-size: 12px; padding: 6px 0 2px; }
-.report-chapter-results { display: flex; flex-direction: column; gap: 12px; }
-.report-chapter-answer { border-color: var(--color-primary-border); }
-.report-answer-bubble { border-color: rgba(47,138,86,.28); }
 .report-final-label { color: var(--color-success); font-weight: 700; font-size: 13px; }
+
 .report-inline h2 { margin: 0 0 12px; font-size: 20px; color: var(--color-text-dark); }
+
 .report-inline h3 { margin: 0 0 10px; font-size: 16px; color: var(--color-text-dark); }
+
 .report-inline-summary { padding: 11px 13px; border-radius: 8px; background: #fff9ef; border-left: 3px solid #f5c76a; margin-bottom: 16px; }
+
 .report-inline-section { margin-top: 16px; }
+
 .report-inline-section h3 { margin: 0 0 7px; font-size: 16px; color: var(--color-text-dark); }
 
-/* ── 回答气泡 ── */
 .answer-bubble {
-  background: #fff;
-  border: 1px solid var(--color-primary-border);
-  border-radius: 16px;
-  border-top-left-radius: 4px;
-  padding: 14px 16px;
-  line-height: 1.7;
-  font-size: 14px;
+  max-width: 100%;
+  background: transparent;
   color: var(--color-text-dark);
-  box-shadow: 0 1px 2px rgba(16, 42, 67, 0.05);
-  display: flex;
-  flex-direction: column;
-  gap: 12px;
 }
 
 .answer-bubble.answer-empty {
@@ -1549,96 +785,7 @@ function pickExampleChip(text: string) {
   color: var(--color-text-light);
 }
 
-/* ── 你可能还想问 Followup ── */
-.followup-wrap {
-  margin-top: 2px;
-  padding-top: 12px;
-  border-top: 1px solid var(--color-primary-border);
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-}
-
-.followup-label {
-  font-size: 12px;
-  color: var(--color-text-light);
-  font-weight: 500;
-}
-
-.followup-chips {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 8px;
-}
-
-.followup-chip {
-  flex-shrink: 0;
-  padding: 6px 14px;
-  border: 1px solid var(--color-primary-border);
-  border-radius: var(--radius-pill);
-  background: #fff;
-  color: var(--color-text-medium);
-  font-size: 12px;
-  cursor: pointer;
-  transition: all 0.15s ease;
-  font-family: inherit;
-  line-height: 1.5;
-}
-
-.followup-chip:hover {
-  background: var(--color-primary-light);
-  color: var(--color-primary);
-  border-color: var(--color-primary);
-}
-
-/* ── 错误/中止卡片 ── */
-.error-card {
-  background: #fff;
-  border: 1px solid var(--color-error, #dc2626);
-  border-radius: 12px;
-  padding: 12px 14px;
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-}
-
 .error-head {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-}
-
-.cancelled-hint {
-  font-size: 12px;
-  color: var(--color-text-light);
-  padding: 2px 4px;
-  line-height: 1.5;
-}
-
-.ac-card {
-  background: #fff;
-  border: 1px solid var(--color-primary-border);
-  border-radius: 12px;
-  overflow: hidden;
-  box-shadow: 0 1px 3px rgba(16, 42, 67, 0.06);
-}
-
-/* 卡片头部 */
-.ac-head {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  padding: 14px 16px;
-  border-bottom: 1px solid rgba(111, 50, 155, 0.06);
-}
-
-.ac-head-left {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-}
-
-.ac-head-right {
   display: flex;
   align-items: center;
   gap: 10px;
@@ -1665,117 +812,15 @@ function pickExampleChip(text: string) {
   color: var(--color-text-dark);
 }
 
-/* 状态徽章 */
-.ac-badge {
-  font-size: 11px;
-  font-weight: 600;
-  padding: 3px 12px;
-  border-radius: var(--radius-pill);
-  background: var(--color-bg-hover, #f0ecf5);
-  color: var(--color-text-medium);
-}
-
-.ac-badge.planning,
-.ac-badge.running,
-.ac-badge.created,
-.ac-badge.needs_data {
-  color: var(--color-primary);
-  background: var(--color-primary-light);
-}
-
-.ac-badge.completed {
-  color: var(--color-success, #059669);
-  background: var(--color-success-bg, #ecfdf5);
-}
-
-.ac-badge.failed {
-  color: var(--color-error, #dc2626);
-  background: var(--color-error-bg, #fef2f2);
-}
-
-.ac-badge.cancelled {
-  color: var(--color-text-light);
-  background: var(--color-bg-hover, #f0ecf5);
-}
-
-.ac-cancelled-hint {
-  margin-top: 8px;
-  font-size: 12px;
-  color: var(--color-text-light);
-}
-
-/* 折叠按钮 */
-.ac-chevron {
+.thinking-bubble {
   display: inline-flex;
   align-items: center;
-  justify-content: center;
-  width: 24px;
-  height: 24px;
-  padding: 0;
-  border: none;
-  background: transparent;
-  color: var(--color-text-light);
-  cursor: pointer;
-  border-radius: 4px;
-  transition: background 0.15s ease, color 0.15s ease;
+  gap: 10px;
 }
 
-.ac-chevron:hover {
-  background: var(--color-bg-hover, #f0ecf5);
-  color: var(--color-text-dark);
-}
-
-/* 中止按钮 */
-.ac-abort-btn {
-  margin-left: 8px;
-  padding: 3px 10px;
-  border: 1px solid var(--color-error, #dc2626);
-  background: transparent;
-  color: var(--color-error, #dc2626);
-  font-size: 11px;
-  font-weight: 500;
-  border-radius: 4px;
-  cursor: pointer;
-  transition: all 0.15s ease;
-}
-
-.ac-abort-btn:hover {
-  background: var(--color-error, #dc2626);
-  color: #fff;
-}
-
-/* 卡片主体 */
-.ac-body {
-  padding: 0 16px 14px;
-  display: flex;
-  flex-direction: column;
-  gap: 12px;
-}
-
-.ac-goal {
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-  padding: 10px 12px;
-  background: var(--color-primary-light);
-  border-radius: 8px;
-  margin-top: 12px;
-}
-
-.ac-goal-label {
-  font-size: 12px;
-  font-weight: 500;
-  color: var(--color-primary);
-}
-
-.ac-goal-label.muted {
-  color: var(--color-text-light);
-}
-
-.flex-row {
-  display: flex;
-  align-items: center;
-  gap: 6px;
+.thinking-label {
+  font-size: 13px;
+  color: var(--color-text-medium);
 }
 
 .loading-dots {
@@ -1850,128 +895,11 @@ function pickExampleChip(text: string) {
   opacity: 1;
 }
 
-.ac-goal-text {
-  font-size: 14px;
-  color: var(--color-text-dark);
-  line-height: 1.5;
-}
-
-.ac-timeline {
-  display: flex;
-  flex-direction: column;
-  margin-top: 4px;
-}
-
-/* 结果区 */
-.ac-result-text {
-  font-size: 14px;
-  color: var(--color-text-dark);
-  line-height: 1.6;
-  padding: 4px 0;
-}
-
-.ac-stats {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
-  gap: 8px;
-}
-
-.ac-stat {
-  display: flex;
-  flex-direction: column;
-  gap: 2px;
-  padding: 10px 12px;
-  background: var(--color-primary-light);
-  border-radius: 6px;
-}
-
-.ac-stat-label {
-  font-size: 12px;
-  color: var(--color-text-light);
-}
-
-.ac-stat-value {
-  font-size: 16px;
-  font-weight: 600;
-  color: var(--color-text-dark);
-}
-
-.ac-details {
-  border-top: 1px solid var(--color-primary-border);
-  padding-top: 8px;
-}
-
-.ac-details-summary {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  font-size: 13px;
-  font-weight: 500;
-  color: var(--color-text-dark);
-  padding: 6px 0;
-  cursor: pointer;
-  list-style: none;
-}
-
-.ac-details-summary::-webkit-details-marker {
-  display: none;
-}
-
-.ac-details-toggle {
-  font-size: 12px;
-  color: var(--color-text-lighter);
-}
-
-.ac-details-content {
-  padding: 8px 10px;
-  background: var(--color-primary-light);
-  border-radius: 6px;
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-}
-
-.ac-details-item {
-  padding: 4px 0;
-  border-bottom: 1px solid var(--color-primary-border);
-}
-
-.ac-details-item:last-child {
-  border-bottom: none;
-}
-
-.ac-field {
-  display: flex;
-  justify-content: space-between;
-  gap: 12px;
-  font-size: 13px;
-  padding: 2px 0;
-}
-
-.ac-field-label {
-  color: var(--color-text-light);
-  flex-shrink: 0;
-  max-width: 40%;
-}
-
-.ac-field-value {
-  color: var(--color-text-dark);
-  text-align: right;
-  word-break: break-word;
-}
-
 .ac-error-text {
   font-size: 13px;
   color: var(--color-error, #dc2626);
   line-height: 1.5;
   padding: 4px 0;
-}
-
-/* ── 输入区 ── */
-.composer {
-  flex-shrink: 0;
-  padding: 10px 16px 4px;
-  background: var(--color-bg-app, #f7f5fb);
 }
 
 .composer-inner {
@@ -2055,7 +983,9 @@ function pickExampleChip(text: string) {
 }
 
 .attachment-icon.word { background: #2b579a; }
+
 .attachment-icon.pdf { background: #c53030; }
+
 .attachment-icon.excel { background: #16803d; }
 
 .attachment-meta {
@@ -2150,7 +1080,9 @@ function pickExampleChip(text: string) {
 }
 
 .upload-menu-icon.word { background: #2b579a; }
+
 .upload-menu-icon.pdf { background: #c53030; }
+
 .upload-menu-icon.excel { background: #16803d; }
 
 .upload-menu-meta {
@@ -2211,6 +1143,60 @@ function pickExampleChip(text: string) {
   cursor: not-allowed;
 }
 
+.resume-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 10px;
+  padding: 9px 12px 9px 14px;
+  border: 1px solid var(--border-1, rgba(0, 0, 0, 0.1));
+  border-radius: var(--radius-md, 10px);
+  background: var(--surface-2, #f7f7f9);
+}
+
+.resume-text {
+  font-size: 13px;
+  color: var(--text-2, #5b5b66);
+}
+
+.resume-btn {
+  flex-shrink: 0;
+  padding: 6px 14px;
+  border: 0;
+  border-radius: var(--radius-pill);
+  background: var(--gradient-primary);
+  color: #fff;
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.resume-btn:disabled {
+  opacity: 0.42;
+  cursor: not-allowed;
+}
+
+.send-btn.is-stop {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  background: var(--surface-2, #f1f1f4);
+  color: var(--text-1, #1f1f22);
+  box-shadow: inset 0 0 0 1px var(--border-1, rgba(0, 0, 0, 0.12));
+}
+
+.send-btn.is-stop:hover:not(:disabled) {
+  background: var(--surface-3, #e8e8ec);
+  box-shadow: inset 0 0 0 1px var(--border-2, rgba(0, 0, 0, 0.2));
+}
+
+.stop-glyph {
+  width: 9px;
+  height: 9px;
+  border-radius: 2px;
+  background: currentColor;
+}
+
 .spinner-small {
   display: inline-block;
   width: 14px;
@@ -2228,18 +1214,6 @@ function pickExampleChip(text: string) {
   }
 }
 
-/* ── 合规提醒 ── */
-.disclaimer {
-  flex-shrink: 0;
-  margin: 0;
-  padding: 4px 12px 10px;
-  text-align: center;
-  font-size: 11px;
-  line-height: 1.5;
-  color: var(--color-text-lighter);
-}
-
-/* ── 响应式 ── */
 @media (max-width: 768px) {
   .chat-scroll {
     padding: 16px 12px 8px;
@@ -2252,56 +1226,5 @@ function pickExampleChip(text: string) {
   .welcome-title {
     font-size: 22px;
   }
-}
-
-/* ── 已完成章节收起按钮 ── */
-.chapter-results-head { display: flex; align-items: center; justify-content: space-between; padding: 2px 0; }
-.chapter-results-label { font-size: 13px; font-weight: 600; color: var(--color-text-dark); }
-.toggle-chapters-btn { background: #fff; border: 1px solid var(--color-primary); border-radius: 6px; padding: 3px 10px; font-size: 12px; color: var(--color-primary); cursor: pointer; transition: background .15s; }
-.toggle-chapters-btn:hover { background: var(--color-primary-light); }
-
-/* ── waiting_user 澄清弹窗 ── */
-.waiting-backdrop {
-  position: fixed; inset: 0; background: rgba(0, 0, 0, 0.45);
-  display: flex; align-items: center; justify-content: center;
-  z-index: 9999; padding: 20px;
-}
-.waiting-dialog { background: #fff; border-radius: 12px; width: 100%; max-width: 520px; box-shadow: 0 12px 40px rgba(0, 0, 0, 0.2); overflow: hidden; }
-.waiting-dialog-head { display: flex; align-items: center; justify-content: space-between; padding: 14px 20px; background: var(--color-primary); color: #fff; }
-.waiting-dialog-title { font-size: 15px; font-weight: 600; }
-.waiting-dialog-close { background: none; border: none; color: #fff; font-size: 20px; line-height: 1; cursor: pointer; padding: 0 2px; opacity: 0.85; transition: opacity .15s; }
-.waiting-dialog-close:hover { opacity: 1; }
-.waiting-dialog-close:disabled { opacity: 0.4; cursor: not-allowed; }
-.waiting-dialog-body { padding: 20px; }
-.waiting-question-text { font-size: 14px; font-weight: 600; color: var(--color-text-dark); line-height: 1.6; }
-.waiting-question-reason { margin-top: 6px; font-size: 12px; color: var(--color-text-light); padding: 8px 10px; background: #f7f7fb; border-radius: 6px; line-height: 1.5; }
-.waiting-tabs { display: flex; gap: 6px; margin-top: 16px; border-bottom: 1px solid var(--color-border); padding-bottom: 0; }
-.waiting-tab { padding: 7px 14px; font-size: 13px; font-weight: 500; background: none; border: none; cursor: pointer; color: var(--color-text-light); border-bottom: 2px solid transparent; margin-bottom: -1px; transition: all .15s; }
-.waiting-tab:hover { color: var(--color-primary); }
-.waiting-tab.active { color: var(--color-primary); border-bottom-color: var(--color-primary); }
-.waiting-tab:disabled { opacity: 0.5; cursor: not-allowed; }
-.waiting-tab-body { margin-top: 14px; }
-.waiting-textarea { width: 100%; resize: vertical; font-size: 14px; padding: 10px 12px; border-radius: 8px; border: 1px solid var(--color-border); background: #fff; font-family: inherit; line-height: 1.6; box-sizing: border-box; transition: border-color .15s; }
-.waiting-textarea:focus { outline: none; border-color: var(--color-primary); }
-.waiting-textarea:disabled { background: #f5f5f5; cursor: not-allowed; }
-.waiting-sql { font-family: 'Consolas', 'Monaco', 'Courier New', monospace; font-size: 13px; }
-.waiting-sql-hint { margin-top: 6px; font-size: 12px; color: var(--color-text-light); }
-.waiting-dialog-foot { display: flex; justify-content: flex-end; gap: 10px; padding: 14px 20px; border-top: 1px solid var(--color-border); background: #fafafa; }
-.waiting-btn-cancel { padding: 7px 16px; font-size: 13px; border-radius: 6px; background: #fff; border: 1px solid var(--color-border); color: var(--color-text-light); cursor: pointer; transition: all .15s; }
-.waiting-btn-cancel:hover { border-color: var(--color-primary); color: var(--color-primary); }
-.waiting-btn-cancel:disabled { opacity: 0.5; cursor: not-allowed; }
-.waiting-btn-submit { padding: 7px 18px; font-size: 13px; border-radius: 6px; background: var(--color-primary); border: none; color: #fff; cursor: pointer; transition: opacity .15s; display: inline-flex; align-items: center; gap: 6px; }
-.waiting-btn-submit:hover { opacity: 0.88; }
-.waiting-btn-submit:disabled { opacity: 0.5; cursor: not-allowed; }
-
-.waiting-dialog-error {
-  margin-top: 12px;
-  padding: 8px 12px;
-  border-radius: 6px;
-  background: #fef2f2;
-  border: 1px solid #fecaca;
-  color: #dc2626;
-  font-size: 13px;
-  line-height: 1.5;
 }
 </style>

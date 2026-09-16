@@ -57,8 +57,10 @@ class PersistentReportSessionRepository(ReportSessionRepository):
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._sessions: dict[str, ReportGenerationSession] = {}
         self._load()
-        # A process cannot resume an in-flight in-memory worker after restart.
-        # Reconcile those records to a terminal state instead of leaving them running.
+        # A process cannot resume an in-flight in-memory worker after restart, so
+        # those records are reconciled to a terminal state. A session waiting on
+        # the user is not in flight: nothing is running, and the answer can still
+        # arrive after a restart, so it is left alone.
         self._reconcile_interrupted()
         self._flush()
 
@@ -83,7 +85,6 @@ class PersistentReportSessionRepository(ReportSessionRepository):
             if session.status in {
                 ReportGenerationStatus.CREATED,
                 ReportGenerationStatus.RUNNING,
-                ReportGenerationStatus.WAITING_USER,
             }:
                 session.status = ReportGenerationStatus.CANCELLED
                 session.current_step = "cancelled_after_backend_restart"

@@ -30,10 +30,17 @@ class Settings:
     data_dir: Path = _data_dir
     artifact_dir: Path = Path(os.getenv("ARTIFACT_DIR", "./artifacts"))
     log_dir: Path = Path(os.getenv("LOG_DIR", "./logs"))
+    # DEBUG additionally dumps each metric's full research conversation, which
+    # is the only way to see what the model was actually shown when a number
+    # comes back wrong.
+    log_level: str = os.getenv("LOG_LEVEL", "INFO").upper()
     database_url: str | None = os.getenv("DATABASE_URL") or None
     llm_base_url: str | None = os.getenv("LLM_BASE_URL") or os.getenv("OPENAI_BASE_URL") or None
     llm_api_key: str | None = os.getenv("LLM_API_KEY") or os.getenv("OPENAI_API_KEY") or None
     llm_model_name: str | None = os.getenv("LLM_MODEL_NAME") or os.getenv("OPENAI_MODEL") or None
+    llm_timeout_seconds: float = float(os.getenv("LLM_TIMEOUT_SECONDS", "60"))
+    llm_max_attempts: int = int(os.getenv("LLM_MAX_ATTEMPTS", "5"))
+    llm_backoff_seconds: float = float(os.getenv("LLM_BACKOFF_SECONDS", "5"))
 
 
 settings = Settings()

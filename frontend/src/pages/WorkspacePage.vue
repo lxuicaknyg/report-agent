@@ -2,7 +2,7 @@
 import { computed, onMounted, ref, watch } from 'vue'
 import { RouterView, useRoute, useRouter } from 'vue-router'
 import { useAuthStore, useConversationStore } from '../stores'
-import type { ConversationSession } from '../types'
+import type { Conversation } from '../types'
 
 const route = useRoute()
 const router = useRouter()
@@ -16,10 +16,10 @@ const userInitial = computed(() =>
   (authStore.username || 'A').slice(0, 1).toUpperCase(),
 )
 
-const sessions = computed(() => conversationStore.sessions)
+const sessions = computed(() => conversationStore.conversations)
 const currentSessionId = computed(() => {
-  const id = route.params.sessionId as string | undefined
-  return id ?? conversationStore.currentSessionId
+  const id = route.params.conversationId as string | undefined
+  return id ?? conversationStore.currentConversationId
 })
 
 const sortedSessions = computed(() => {
@@ -50,7 +50,7 @@ onMounted(async () => {
     /* ignore */
   }
   try {
-    await conversationStore.ensureSessionListLoaded()
+    await conversationStore.loadConversations()
   } catch {
     /* ignore — 后端暂无路由时 LS 兜底 */
   }
@@ -70,21 +70,21 @@ async function handleLogout() {
 }
 
 async function handleNewSession() {
-  const s = await conversationStore.createSession('新会话')
+  const s = await conversationStore.createConversation()
   if (s) {
     await router.push({
       name: 'conversation-detail',
-      params: { sessionId: s.id },
+      params: { conversationId: s.conversation_id },
     })
   } else {
     await router.push({ name: 'conversation-new' })
   }
 }
 
-function openSession(s: ConversationSession) {
+function openSession(s: Conversation) {
   router.push({
     name: 'conversation-detail',
-    params: { sessionId: s.id },
+    params: { conversationId: s.conversation_id },
   })
 }
 
@@ -102,13 +102,13 @@ async function handleDeleteSession(
   if (!ok) return
   const wasActive =
     currentSessionId.value === sessionId && isConversationRoute.value
-  await conversationStore.deleteSession(sessionId)
+  await conversationStore.deleteConversation(sessionId)
   if (wasActive) {
     await router.push({ name: 'conversation-new' })
   }
 }
 
-function formatTime(s: ConversationSession): string {
+function formatTime(s: Conversation): string {
   if (!s.updated_at) return ''
   try {
     const d = new Date(s.updated_at)
@@ -134,7 +134,8 @@ function formatTime(s: ConversationSession): string {
         <img src="/logo.png" alt="Logo" class="brand-logo" />
         <span class="brand-divider" aria-hidden="true"></span>
         <div class="brand-copy">
-          <strong>智能报告工作台</strong>
+          <strong>AI数据分析工作台</strong>
+          <span class="brand-copy-en">AI Analysis</span>
         </div>
       </div>
 
@@ -143,12 +144,12 @@ function formatTime(s: ConversationSession): string {
           :to="{ name: 'conversation-new' }"
           class="primary-nav-item"
           :class="{ active: activeNav === 'reports' }"
-          >报告任务</RouterLink
+          >报告生成</RouterLink
         >
         <span
           class="primary-nav-item disabled"
           title="历史记录接口尚未开放"
-          >任务记录</span
+          >报告记录</span
         >
         <span
           class="primary-nav-item disabled"
@@ -184,6 +185,20 @@ function formatTime(s: ConversationSession): string {
             >
               <span>新会话</span>
             </button>
+            <RouterLink
+              :to="{ name: 'connections' }"
+              class="sidebar-link"
+              :class="{ active: activeNav === 'connections' }"
+            >
+              <span class="sidebar-link-icon" aria-hidden="true">
+                <svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.4">
+                  <ellipse cx="8" cy="3.6" rx="5.2" ry="2.1" />
+                  <path d="M2.8 3.6v8.8c0 1.16 2.33 2.1 5.2 2.1s5.2-.94 5.2-2.1V3.6" />
+                  <path d="M2.8 8c0 1.16 2.33 2.1 5.2 2.1s5.2-.94 5.2-2.1" />
+                </svg>
+              </span>
+              <span>数据源</span>
+            </RouterLink>
           </div>
 
           <div class="sidebar-section">
@@ -194,19 +209,18 @@ function formatTime(s: ConversationSession): string {
               </div>
               <div
                 v-for="s in sortedSessions"
-                :key="s.id"
+                :key="s.conversation_id"
                 class="session-item-wrap"
               >
                 <button
                   type="button"
                   class="session-item"
                   :class="{
-                    active: currentSessionId === s.id && isConversationRoute,
+                    active: currentSessionId === s.conversation_id && isConversationRoute,
                   }"
                   @click="openSession(s)"
                   :title="s.title"
                 >
-                  <span class="session-icon" aria-hidden="true">💬</span>
                   <span class="session-title">{{ s.title }}</span>
                   <span class="session-time">{{ formatTime(s) }}</span>
                 </button>
@@ -215,7 +229,7 @@ function formatTime(s: ConversationSession): string {
                   class="session-delete"
                   title="删除会话"
                   aria-label="删除会话"
-                  @click.stop="handleDeleteSession(s.id, s.title)"
+                  @click.stop="handleDeleteSession(s.conversation_id, s.title)"
                 >
                   <svg
                     viewBox="0 0 24 24"
@@ -328,9 +342,19 @@ function formatTime(s: ConversationSession): string {
 }
 
 .brand-copy {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 8px;
   font-size: 18px;
   color: var(--color-text-dark, #102a43);
   letter-spacing: 0.3px;
+}
+
+.brand-copy-en {
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--color-text-light, #9ca3af);
+  letter-spacing: 0.4px;
 }
 
 .primary-nav {
@@ -481,6 +505,44 @@ function formatTime(s: ConversationSession): string {
   box-shadow: 0 6px 16px rgba(123, 63, 178, 0.28);
 }
 
+.sidebar-link {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  height: 38px;
+  margin-top: 8px;
+  padding: 0 12px;
+  border-radius: 10px;
+  color: var(--color-text-medium);
+  font-size: 13px;
+  font-weight: 500;
+  text-decoration: none;
+  transition: background 0.14s ease, color 0.14s ease;
+}
+
+.sidebar-link:hover {
+  background: var(--color-bg-hover);
+  color: var(--color-primary);
+}
+
+.sidebar-link.active {
+  background: var(--color-bg-active);
+  color: var(--color-primary);
+  font-weight: 600;
+}
+
+.sidebar-link-icon {
+  display: inline-flex;
+  align-items: center;
+  color: var(--color-text-light);
+}
+
+.sidebar-link:hover .sidebar-link-icon,
+.sidebar-link.active .sidebar-link-icon {
+  color: var(--color-primary);
+}
+
 .section-label {
   padding: 10px 12px 6px;
   font-size: 11px;
@@ -530,12 +592,6 @@ function formatTime(s: ConversationSession): string {
   min-width: 0;
   flex: 1;
   font-family: inherit;
-}
-
-.session-icon {
-  flex-shrink: 0;
-  font-size: 15px;
-  line-height: 1;
 }
 
 .session-title {

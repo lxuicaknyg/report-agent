@@ -39,3 +39,6 @@ backend/.venv/
 __pycache__/
 *.pyc
 backend/**/__pycache__/
+
+# MS Office lock files
+~$*

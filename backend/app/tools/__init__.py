@@ -1,3 +1,17 @@
-from .dataset_tools import ListDatasetsTool, ListSheetsTool, ProfileDatasetTool, QueryDatasetTool, ReadDatasetTool
+from .dataset_tools import (
+    AggregateDatasetTool,
+    ListDatasetsTool,
+    ListSheetsTool,
+    ProfileDatasetTool,
+    ReadDatasetTool,
+)
+from .sql2sql_tool import GenerateAnalysisSQLTool
 
-__all__ = ["ListDatasetsTool", "ListSheetsTool", "ProfileDatasetTool", "QueryDatasetTool", "ReadDatasetTool"]
+__all__ = [
+    "AggregateDatasetTool",
+    "ListDatasetsTool",
+    "ListSheetsTool",
+    "ProfileDatasetTool",
+    "ReadDatasetTool",
+    "GenerateAnalysisSQLTool",
+]

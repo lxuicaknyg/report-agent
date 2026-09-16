@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from collections.abc import Awaitable, Callable
 
 from ..core.reports import (
     ChapterDraft,
@@ -22,8 +23,15 @@ class ChapterWriter(ABC):
         self,
         input: ChapterWriterInput,
         session: ReportGenerationSession,
+        checkpoint: Callable[[], Awaitable[None]] | None = None,
     ) -> ChapterWriterResult:
-        pass
+        """Write one chapter.
+
+        ``checkpoint`` is awaited at the writer's own natural break points and
+        raises when the user has stopped the run, so a chapter that takes
+        minutes can be interrupted between metrics instead of only between
+        chapters. Writers that finish quickly may ignore it.
+        """
 
 
 class StubChapterWriter(ChapterWriter):
@@ -33,6 +41,7 @@ class StubChapterWriter(ChapterWriter):
         self,
         input: ChapterWriterInput,
         session: ReportGenerationSession,
+        checkpoint: Callable[[], Awaitable[None]] | None = None,
     ) -> ChapterWriterResult:
         source_names = "、".join(source.name for source in input.data_sources) or "未提供数据源"
         original = input.section.example_content or "模板未提供章节示例正文。"
@@ -47,6 +56,12 @@ class StubChapterWriter(ChapterWriter):
             f"后续 ChapterWriterAgent 将基于章节原文和数据源元数据执行 ReAct 取数，"
             f"再生成最终章节内容。"
         )
+        for subsection in input.subsections:
+            depth = max(1, subsection.level - input.section.level)
+            content += (
+                f"\n\n{'#' * (2 + depth)} {subsection.title}\n\n"
+                f"子节占位正文（{subsection.section_id}）。"
+            )
         draft = ChapterDraft(
             chapter_id=input.section.section_id,
             section_id=input.section.section_id,

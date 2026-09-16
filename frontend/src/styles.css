@@ -18,6 +18,8 @@
   --color-bg-card: #ffffff;
   --color-bg-hover: rgba(111, 50, 155, 0.05);
   --color-bg-active: rgba(111, 50, 155, 0.1);
+  --color-bubble-user-bg: rgba(123, 63, 178, 0.12);
+  --color-bubble-user-border: rgba(123, 63, 178, 0.16);
   --color-bg-gray: #eef2f5;
   --color-border: #d9e2ec;
   --color-text-dark: #3a2a55;
@@ -71,6 +73,51 @@ a:hover { text-decoration: underline; }
 ::-webkit-scrollbar-thumb:hover { background: rgba(111, 50, 155, 0.4); }
 
 .truncate { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* Markdown 渲染：对话流、章节正文和报告详情共用一套排版 */
+.md-content .md-h { font-weight: 700; color: var(--color-text-dark); margin: 0.8em 0 0.4em; line-height: 1.35; }
+.md-content .md-h1 { font-size: 22px; }
+.md-content .md-h2 { font-size: 18px; }
+.md-content .md-h3 { font-size: 15.5px; }
+.md-content .md-h4, .md-content .md-h5, .md-content .md-h6 { font-size: 14px; }
+.md-content .md-h:first-child { margin-top: 0; }
+.md-content .md-p { margin: 0 0 10px; }
+.md-content .md-p:last-child { margin-bottom: 0; }
+.md-content .md-ul, .md-content .md-ol { padding-left: 22px; margin: 0 0 10px; }
+.md-content .md-ul { list-style: disc; }
+.md-content .md-ol { list-style: decimal; }
+.md-content .md-li { margin: 2px 0; line-height: 1.7; }
+.md-content .md-strong { font-weight: 700; color: var(--color-text-dark); }
+.md-content .md-em { font-style: italic; }
+.md-content .md-inline-code {
+  font-family: 'JetBrains Mono', Consolas, monospace;
+  font-size: 0.92em;
+  background: #f5f3fa;
+  color: #4b3f66;
+  padding: 1px 6px;
+  border-radius: 4px;
+}
+.md-content .md-link { color: var(--color-primary); text-decoration: underline; }
+.md-content table {
+  width: 100%;
+  margin: 0 0 12px;
+  border-collapse: collapse;
+  font-size: 0.94em;
+  /* 报告里的表可能很宽，让它自己横向滚动，别把对话流撑开 */
+  display: block;
+  overflow-x: auto;
+}
+.md-content th, .md-content td {
+  padding: 6px 10px;
+  border: 1px solid var(--color-primary-border);
+  text-align: left;
+  white-space: nowrap;
+}
+.md-content th {
+  background: var(--color-primary-light);
+  color: var(--color-text-dark);
+  font-weight: 600;
+}
 
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after {

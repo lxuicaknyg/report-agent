@@ -58,3 +58,41 @@ def test_read_request_validates_pagination():
     request = DataReadRequest(sheet_name="销售明细", limit=20, offset=5)
     assert request.limit == 20
     assert request.offset == 5
+
+
+def test_a_dataset_registered_by_an_earlier_run_is_recovered_on_demand():
+    """Sessions outlive the process; the in-memory catalog does not."""
+    from app.data.catalog import DataCatalog
+    from app.data.sources.excel import ExcelDataSource
+
+    directory = Path(tempfile.mkdtemp())
+    path = directory / "excel_abc123_data.xlsx"
+    workbook = Workbook()
+    workbook.active.append(["value"])
+    workbook.active.append([1])
+    workbook.save(path)
+
+    looked_up: list[str] = []
+
+    def restore(dataset_id: str):
+        looked_up.append(dataset_id)
+        found = next(directory.glob(f"{dataset_id}_*"), None)
+        if found is None:
+            return None
+        return ExcelDataSource(path=found, dataset_id=dataset_id, name=found.name)
+
+    catalog = DataCatalog(restore=restore)
+    source = catalog.get_source("excel_abc123")
+
+    assert source is not None
+    assert looked_up == ["excel_abc123"]
+    # Recovered once, then served from memory.
+    assert catalog.get_source("excel_abc123") is source
+    assert looked_up == ["excel_abc123"]
+
+    try:
+        catalog.get_source("excel_missing")
+    except KeyError as exc:
+        assert "excel_missing" in str(exc)
+    else:
+        raise AssertionError("未知数据集仍应报错")

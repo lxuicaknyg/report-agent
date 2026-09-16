@@ -1,326 +1,203 @@
 import { defineStore } from 'pinia'
-import { ref, computed } from 'vue'
-import type { ConversationSession, Task } from '../types'
-import { conversationApi, type SubmitTaskAttachmentRef } from '../services/api'
-import { taskApi } from '../services/api'
+import { computed, ref } from 'vue'
+import type { Conversation, Message, ReportGenerationSession } from '../types'
+import { conversationApi, type PostMessageInput } from '../services/api/conversations'
 
-const LS_SESSIONS_KEY = 'report-agent:sessions-v1'
-const LS_TASKS_KEY = 'report-agent:conversation-tasks-v1'
+const POLL_INTERVAL_MS = 2000
 
-function loadSessionsFromLS(): ConversationSession[] {
-  try {
-    const raw = localStorage.getItem(LS_SESSIONS_KEY)
-    if (!raw) return []
-    const parsed = JSON.parse(raw) as unknown
-    if (!Array.isArray(parsed)) return []
-    return parsed.filter((x): x is ConversationSession =>
-      x && typeof x === 'object' &&
-      typeof (x as Record<string, unknown>).id === 'string' &&
-      typeof (x as Record<string, unknown>).title === 'string'
-    )
-  } catch {
-    return []
-  }
-}
-
-function persistSessions(sessions: ConversationSession[]) {
-  try {
-    localStorage.setItem(LS_SESSIONS_KEY, JSON.stringify(sessions.map(s => ({
-      id: s.id,
-      title: s.title,
-      created_at: s.created_at,
-      updated_at: s.updated_at,
-    }))))
-  } catch {
-    /* ignore */
-  }
-}
-
-function loadTasksFromLS(): Task[] {
-  try {
-    const raw = localStorage.getItem(LS_TASKS_KEY)
-    if (!raw) return []
-    const parsed = JSON.parse(raw) as unknown
-    if (!Array.isArray(parsed)) return []
-    return parsed.filter((x): x is Task =>
-      x && typeof x === 'object' &&
-      typeof (x as Record<string, unknown>).id === 'string' &&
-      typeof (x as Record<string, unknown>).conversation_id === 'string'
-    )
-  } catch {
-    return []
-  }
-}
-
-function persistTasks(tasks: Task[]) {
-  try {
-    localStorage.setItem(LS_TASKS_KEY, JSON.stringify(tasks))
-  } catch {
-    /* ignore */
-  }
-}
-
-function createLocalSessionRecord(title?: string): ConversationSession {
-  const now = new Date().toISOString()
-  return {
-    id: `local_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`,
-    title: title?.trim() || '新会话',
-    created_at: now,
-    updated_at: now,
-  }
-}
-
-function isConversationEndpointUnavailable(result: { success: boolean; error?: { code?: string; message?: string } }): boolean {
-  if (result.success) return false
-  const message = result.error?.message || ''
-  const code = result.error?.code || ''
-  return code === 'NOT_FOUND' || /404|not found|不存在|未找到/i.test(message)
-}
-
+/**
+ * Server-backed conversation state.
+ *
+ * The backend owns every transition; this store only mirrors it. There is no
+ * local cache to reconcile, and no business branching here — messages arrive
+ * already shaped for rendering.
+ */
 export const useConversationStore = defineStore('conversation', () => {
-  const sessions = ref<ConversationSession[]>(loadSessionsFromLS())
-  const currentSessionId = ref<string | null>(null)
-  const currentTaskId = ref<string | null>(null)
-  const tasks = ref<Task[]>(loadTasksFromLS())
+  const conversations = ref<Conversation[]>([])
+  const messages = ref<Message[]>([])
+  const currentConversationId = ref<string | null>(null)
+  const reportSession = ref<ReportGenerationSession | null>(null)
   const isLoading = ref(false)
   const isSending = ref(false)
+  const isCancelling = ref(false)
+  const error = ref<string | null>(null)
 
-  const currentSession = computed(() =>
-    sessions.value.find((s) => s.id === currentSessionId.value) ?? null
+  let pollTimer: ReturnType<typeof setInterval> | null = null
+
+  const currentConversation = computed(
+    () => conversations.value.find((item) => item.conversation_id === currentConversationId.value) ?? null,
   )
 
-  const currentTask = computed(() =>
-    tasks.value.find((t) => t.id === currentTaskId.value) ?? null
-  )
+  /** True while the backend still owes us an assistant turn. */
+  const isAwaitingAssistant = computed(() => {
+    const last = messages.value[messages.value.length - 1]
+    if (!last) return false
+    if (last.role === 'user') return true
+    const status = reportSession.value?.status
+    return status === 'created' || status === 'running'
+  })
 
-  const currentPlan = computed(() => currentTask.value?.plan ?? null)
+  /** True while a run is in flight and can be stopped. */
+  const isGenerating = computed(() => {
+    const status = reportSession.value?.status
+    return status === 'created' || status === 'running'
+  })
 
-  const allTasks = computed(() => tasks.value)
+  /** True for a run that stopped with progress on disk and can be picked up again. */
+  const isResumable = computed(() => {
+    const status = reportSession.value?.status
+    return status === 'cancelled' || status === 'failed'
+  })
 
-  function getSessionTasks(sessionId: string): Task[] {
-    return tasks.value.filter((t) => t.conversation_id === sessionId)
+  function stopPolling() {
+    if (pollTimer) {
+      clearInterval(pollTimer)
+      pollTimer = null
+    }
   }
 
-  function getTaskCountByStatus(status: string): number {
-    return tasks.value.filter((t) => t.status === status).length
+  function startPolling() {
+    stopPolling()
+    pollTimer = setInterval(async () => {
+      if (!currentConversationId.value) return stopPolling()
+      await refresh(currentConversationId.value)
+      if (!isAwaitingAssistant.value) stopPolling()
+    }, POLL_INTERVAL_MS)
   }
 
-  async function createSession(title?: string): Promise<ConversationSession | null> {
+  async function loadConversations() {
     isLoading.value = true
     try {
-      const result = await conversationApi.createSession(title)
-      if (result.success && result.data) {
-        sessions.value.unshift(result.data)
-        persistSessions(sessions.value)
-        currentSessionId.value = result.data.id
-        currentTaskId.value = null
-        return result.data
-      }
-      // 当前后端尚未提供 conversations CRUD；报告任务的会话关系可以先由前端本地维护。
-      if (isConversationEndpointUnavailable(result)) {
-        const localSession = createLocalSessionRecord(title)
-        sessions.value.unshift(localSession)
-        persistSessions(sessions.value)
-        currentSessionId.value = localSession.id
-        currentTaskId.value = null
-        return localSession
-      }
+      const result = await conversationApi.list()
+      if (result.success && Array.isArray(result.data)) conversations.value = result.data
+      else if (result.error) error.value = result.error.message
+      return conversations.value
+    } finally {
+      isLoading.value = false
+    }
+  }
+
+  async function refresh(conversationId: string) {
+    const result = await conversationApi.get(conversationId)
+    if (!result.success || !result.data) {
+      if (result.error) error.value = result.error.message
       return null
-    } finally {
-      isLoading.value = false
     }
+    if (currentConversationId.value !== conversationId) return result.data
+    messages.value = result.data.messages
+    reportSession.value = result.data.report_session ?? null
+    const index = conversations.value.findIndex((item) => item.conversation_id === conversationId)
+    if (index === -1) conversations.value.unshift(result.data.conversation)
+    else conversations.value[index] = result.data.conversation
+    return result.data
   }
 
-  async function ensureSessionListLoaded() {
-    try {
-      isLoading.value = true
-      const result = await conversationApi.listConversations()
-      if (result.success && Array.isArray(result.data) && result.data.length > 0) {
-        sessions.value = result.data.map(serverSession => {
-          const idx = sessions.value.findIndex((s) => s.id === serverSession.id)
-          if (idx === -1) return serverSession
-          const existing = sessions.value[idx]
-          const finalTitle =
-            existing.title &&
-            existing.title !== '新会话' &&
-            existing.title !== '新对话'
-              ? existing.title
-              : (serverSession.title || existing.title || '新会话')
-          return {
-            ...serverSession,
-            id: existing.id,
-            title: finalTitle,
-            created_at: existing.created_at || serverSession.created_at,
-            updated_at: serverSession.updated_at || existing.updated_at,
-          }
-        })
-        persistSessions(sessions.value)
-      }
-    } catch {
-      /* 老版本后端没有 list 接口 — 保留 localStorage 中的 */
-    } finally {
-      isLoading.value = false
-    }
-  }
-
-  async function selectSession(sessionId: string) {
-    currentSessionId.value = sessionId
+  async function selectConversation(conversationId: string) {
+    stopPolling()
+    currentConversationId.value = conversationId
+    messages.value = []
+    reportSession.value = null
     isLoading.value = true
     try {
-      // 本地兜底会话没有对应的后端资源，直接使用本地缓存即可。
-      if (sessionId.startsWith('local_')) return
-      const result = await conversationApi.getSession(sessionId)
-      if (result.success && result.data) {
-        const serverSession = result.data
-        const idx = sessions.value.findIndex((s) => s.id === sessionId)
-        if (idx !== -1) {
-          const existing = sessions.value[idx]
-          const finalTitle =
-            existing.title &&
-            existing.title !== '新会话' &&
-            existing.title !== '新对话'
-              ? existing.title
-              : (serverSession.title || existing.title || '新会话')
-          sessions.value[idx] = {
-            ...serverSession,
-            id: existing.id,
-            title: finalTitle,
-            created_at: existing.created_at || serverSession.created_at,
-            updated_at: serverSession.updated_at || existing.updated_at,
-          }
-        } else {
-          sessions.value.unshift(serverSession)
-        }
-        persistSessions(sessions.value)
-      }
+      await refresh(conversationId)
+      if (isAwaitingAssistant.value) startPolling()
     } finally {
       isLoading.value = false
-      const sessionTasks = tasks.value
-        .filter((t) => t.conversation_id === sessionId)
-        .sort((a, b) => (a.created_at || '').localeCompare(b.created_at || ''))
-      currentTaskId.value = sessionTasks.length > 0 ? sessionTasks[sessionTasks.length - 1].id : null
     }
   }
 
-  async function sendMessage(
-    content: string,
-    opts?: { attachments?: SubmitTaskAttachmentRef[] },
-  ): Promise<Task | null> {
-    if (!currentSessionId.value) return null
+  async function createConversation(title?: string): Promise<Conversation | null> {
+    const result = await conversationApi.create(title)
+    if (!result.success || !result.data) {
+      if (result.error) error.value = result.error.message
+      return null
+    }
+    conversations.value.unshift(result.data)
+    currentConversationId.value = result.data.conversation_id
+    messages.value = []
+    reportSession.value = null
+    return result.data
+  }
+
+  async function sendMessage(input: PostMessageInput): Promise<boolean> {
+    const conversationId = currentConversationId.value
+    if (!conversationId) {
+      error.value = '当前会话尚未准备完成，请稍后重试'
+      return false
+    }
     isSending.value = true
+    error.value = null
     try {
-      const result = await conversationApi.submitTask(
-        currentSessionId.value,
-        content,
-        { attachments: opts?.attachments },
-      )
-      if (result.success && result.data) {
-        const task = result.data
-        tasks.value.push(task)
-        persistTasks(tasks.value)
-        currentTaskId.value = task.id
-        return task
+      const result = await conversationApi.postMessage(conversationId, input)
+      if (!result.success || !result.data) {
+        error.value = result.error?.message || '消息发送失败，请重试'
+        return false
       }
-      return null
+      messages.value = [...messages.value, result.data]
+      startPolling()
+      return true
     } finally {
       isSending.value = false
     }
   }
 
-  function setTask(task: Task) {
-    const idx = tasks.value.findIndex((t) => t.id === task.id)
-    if (idx !== -1) {
-      tasks.value[idx] = task
-    } else {
-      tasks.value.push(task)
-    }
-    persistTasks(tasks.value)
-    currentTaskId.value = task.id
-  }
-
-  function updateTask(taskId: string, updates: Partial<Task>) {
-    const idx = tasks.value.findIndex((t) => t.id === taskId)
-    if (idx !== -1) {
-      tasks.value[idx] = { ...tasks.value[idx], ...updates }
-      persistTasks(tasks.value)
-    }
-  }
-
-  function clearCurrentTask() {
-    currentTaskId.value = null
-  }
-
-  async function refreshTask(taskId: string): Promise<Task | null> {
+  async function cancelGeneration(): Promise<boolean> {
+    const conversationId = currentConversationId.value
+    if (!conversationId || isCancelling.value) return false
+    isCancelling.value = true
+    error.value = null
     try {
-      const result = await taskApi.getTask(taskId)
-      if (result.success && result.data) {
-        setTask(result.data)
-        return result.data
+      const result = await conversationApi.cancel(conversationId)
+      if (!result.success) {
+        error.value = result.error?.message || '停止失败，请重试'
+        return false
       }
-    } catch {
-      /* ignore transient network errors — keep latest store value */
+      // The stop posts its own message, so pull the thread rather than
+      // patching state locally and drifting from what the backend recorded.
+      await refresh(conversationId)
+      stopPolling()
+      return true
+    } finally {
+      isCancelling.value = false
     }
-    return null
   }
 
-  function updateConversationTitle(sessionId: string, title: string) {
-    if (!sessionId || !title) return
-    const idx = sessions.value.findIndex((s) => s.id === sessionId)
-    if (idx === -1) return
-    const trimmed = title.trim()
-    if (!trimmed) return
-    const finalTitle = trimmed.length > 20 ? trimmed.slice(0, 20) + '…' : trimmed
-    if (sessions.value[idx].title === finalTitle) return
-    sessions.value[idx] = {
-      ...sessions.value[idx],
-      title: finalTitle,
-      updated_at: new Date().toISOString(),
+  async function deleteConversation(conversationId: string) {
+    conversations.value = conversations.value.filter((item) => item.conversation_id !== conversationId)
+    if (currentConversationId.value === conversationId) {
+      stopPolling()
+      currentConversationId.value = null
+      messages.value = []
+      reportSession.value = null
     }
-    persistSessions(sessions.value)
+    await conversationApi.remove(conversationId)
   }
 
-  async function deleteSession(sessionId: string) {
-    const idx = sessions.value.findIndex((s) => s.id === sessionId)
-    if (idx !== -1) {
-      sessions.value.splice(idx, 1)
-      persistSessions(sessions.value)
-    }
-    const taskCountBefore = tasks.value.length
-    tasks.value = tasks.value.filter(t => t.conversation_id !== sessionId)
-    if (tasks.value.length !== taskCountBefore) persistTasks(tasks.value)
-    if (currentSessionId.value === sessionId) {
-      currentSessionId.value = null
-      currentTaskId.value = null
-    }
-    try {
-      await conversationApi.deleteSession(sessionId)
-    } catch {
-      /* 后端暂时无 DELETE 路由，静默本地删除即可 */
-    }
+  function clearError() {
+    error.value = null
   }
 
   return {
-    sessions,
-    currentSessionId,
-    currentSession,
-    currentTaskId,
-    currentTask,
-    currentPlan,
-    tasks,
-    allTasks,
+    conversations,
+    messages,
+    currentConversationId,
+    currentConversation,
+    reportSession,
     isLoading,
     isSending,
-    createSession,
-    selectSession,
+    isCancelling,
+    isGenerating,
+    isResumable,
+    isAwaitingAssistant,
+    error,
+    loadConversations,
+    refresh,
+    selectConversation,
+    createConversation,
     sendMessage,
-    setTask,
-    updateTask,
-    clearCurrentTask,
-    refreshTask,
-    updateConversationTitle,
-    deleteSession,
-    getSessionTasks,
-    getTaskCountByStatus,
-    ensureSessionListLoaded,
+    cancelGeneration,
+    deleteConversation,
+    clearError,
+    stopPolling,
   }
 })

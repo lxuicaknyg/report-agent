@@ -29,10 +29,10 @@ const router = createRouter({
           meta: { nav: 'datasets' },
         },
         {
-          path: 'analysis',
-          name: 'analysis',
-          component: () => import('../features/analysis/AnalysisHomePage.vue'),
-          meta: { nav: 'analysis' },
+          path: 'connections',
+          name: 'connections',
+          component: () => import('../features/connections/DataSourcePage.vue'),
+          meta: { nav: 'connections' },
         },
         {
           path: 'reports',
@@ -44,12 +44,6 @@ const router = createRouter({
           path: 'reports/templates',
           name: 'report-templates',
           component: () => import('../features/reports/ReportTemplatesPage.vue'),
-          meta: { nav: 'reports' },
-        },
-        {
-          path: 'reports/create',
-          name: 'create-report',
-          component: () => import('../features/reports/CreateReportPage.vue'),
           meta: { nav: 'reports' },
         },
         {
@@ -71,16 +65,10 @@ const router = createRouter({
           meta: { nav: 'reports' },
         },
         {
-          path: 'conversations/:sessionId',
+          path: 'conversations/:conversationId',
           name: 'conversation-detail',
           component: () => import('../features/conversations/ConversationView.vue'),
           meta: { nav: 'reports' },
-        },
-        {
-          path: 'tasks',
-          name: 'tasks',
-          component: () => import('../features/tasks/TasksPlaceholderPage.vue'),
-          meta: { nav: 'tasks' },
         },
         {
           path: 'capabilities',

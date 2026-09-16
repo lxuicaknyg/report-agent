@@ -41,16 +41,16 @@ async function handleLogin() {
   <div class="login-page">
     <section class="login-brand-panel">
       <div class="brand-lockup">
-        <img src="/logo.png" alt="AI Report" />
+        <img src="/logo.png" alt="AI数据分析工作台" />
         <div>
-          <strong>AI Report</strong>
-          <span>智能报告工作台</span>
+          <strong>AI数据分析工作台</strong>
+          <span>AI Analysis</span>
         </div>
       </div>
 
       <div class="brand-message">
-        <h1>让每一份报告，都能看见数据与过程。</h1>
-        <p>任务计划、执行进度、章节结果和数据来源统一呈现。</p>
+        <h1>让数据分析师专注分析，而非报告撰写。</h1>
+        <p>从数据梳理到报告成文，AI 陪伴分析师规划、查询与写作，全面提升数据分析效率。</p>
       </div>
 
       <div class="brand-footer">
@@ -62,7 +62,7 @@ async function handleLogin() {
     <section class="login-form-panel">
       <div class="login-form">
         <h2 class="form-title">欢迎回来</h2>
-        <p class="form-subtitle">登录以使用智能报告工作台</p>
+        <p class="form-subtitle">登录以使用 AI数据分析工作台</p>
 
         <div v-if="errorMessage" class="form-error">
           {{ errorMessage }}
@@ -118,10 +118,6 @@ async function handleLogin() {
           <span v-if="isSubmitting" class="spinner-small" aria-hidden="true" />
           {{ isSubmitting ? '登录中…' : '登录' }}
         </button>
-
-        <p class="form-tip">
-          <strong>说明：</strong>当前为开发环境假登录模式，输入任意账号密码即可。正式认证接口由后端后续提供。
-        </p>
       </div>
     </section>
   </div>
@@ -172,9 +168,6 @@ async function handleLogin() {
 .submit-btn:hover:not(:disabled) { background: linear-gradient(180deg, #6f329b, #5a2d85); }
 .submit-btn:disabled { cursor: not-allowed; opacity: 0.6; }
 .spinner-small { width: 14px; height: 14px; border: 2px solid rgba(255, 255, 255, 0.4); border-top-color: #fff; border-radius: 50%; animation: spin 0.75s linear infinite; }
-
-.form-tip { margin: 16px 0 0; color: #829ab1; font-size: 11px; line-height: 1.55; }
-.form-tip strong { color: #3a2a55; font-weight: 700; }
 
 .brand-footer { display: flex; align-items: center; justify-content: space-between; padding-top: 18px; border-top: 1px solid rgba(111, 50, 155, 0.12); color: #6f6285; font-size: 11px; line-height: 1.4; }
 .brand-footer span + span { text-align: right; }

@@ -1,6 +1,5 @@
 export { useAuthStore } from './auth'
 export { useDatasetStore } from './dataset'
-export { useAnalysisStore } from './analysis'
 export { useReportStore } from './report'
 export { useConversationStore } from './conversation'
-export { useTaskStore } from './task'
+export { useConnectionStore } from './connection'

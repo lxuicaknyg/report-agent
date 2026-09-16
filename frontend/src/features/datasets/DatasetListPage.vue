@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { onMounted, onUnmounted, ref } from 'vue'
+import { onMounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { useDatasetStore } from '../../stores/dataset'
 import { datasetApi } from '../../services/api/datasets'
@@ -23,26 +23,6 @@ const excelDescription = ref('')
 const excelSubmitting = ref(false)
 const excelError = ref<string | null>(null)
 const excelFileInput = ref<HTMLInputElement | null>(null)
-const successMessage = ref<string | null>(null)
-const EXCEL_EXTENSIONS = ['.xlsx', '.xls']
-let successTimer: ReturnType<typeof setTimeout> | null = null
-
-function isExcelFile(file: File): boolean {
-  const name = file.name.toLowerCase()
-  return EXCEL_EXTENSIONS.some((ext) => name.endsWith(ext))
-}
-
-function showSuccess(msg: string) {
-  successMessage.value = msg
-  if (successTimer) clearTimeout(successTimer)
-  successTimer = setTimeout(() => {
-    successMessage.value = null
-  }, 3500)
-}
-
-onUnmounted(() => {
-  if (successTimer) clearTimeout(successTimer)
-})
 
 function openExcelModal() {
   excelFile.value = null
@@ -53,44 +33,20 @@ function openExcelModal() {
 }
 
 function closeExcelModal() {
-  if (excelSubmitting.value) return
   showExcelModal.value = false
 }
 
 function onExcelFileChange(e: Event) {
-  const input = e.target as HTMLInputElement
-  const file = input.files?.[0]
-  excelError.value = null
-  if (!file) {
-    excelFile.value = null
-    return
-  }
-  if (!isExcelFile(file)) {
-    excelFile.value = null
-    excelError.value = '仅支持 .xlsx / .xls 格式的 Excel 文件'
-    input.value = ''
-    return
-  }
-  excelFile.value = file
-  if (!excelName.value) {
+  const file = (e.target as HTMLInputElement).files?.[0]
+  excelFile.value = file ?? null
+  if (file && !excelName.value) {
     excelName.value = file.name.replace(/\.xlsx?$/i, '')
   }
+  excelError.value = null
 }
 
 function triggerExcelFileSelect() {
   excelFileInput.value?.click()
-}
-
-function removeExcelFile(e: Event) {
-  e.stopPropagation()
-  excelFile.value = null
-  if (excelFileInput.value) excelFileInput.value.value = ''
-}
-
-function formatFileSize(bytes: number): string {
-  if (bytes < 1024) return `${bytes} B`
-  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`
-  return `${(bytes / 1024 / 1024).toFixed(1)} MB`
 }
 
 async function submitExcel() {
@@ -104,13 +60,12 @@ async function submitExcel() {
   }
   excelSubmitting.value = true
   excelError.value = null
-  let uploadedName: string | null = null
   try {
     const res = await datasetApi.uploadExcel(excelFile.value)
     if (res.success && res.data) {
       store.addDataset(res.data)
       void store.loadDatasets(true)
-      uploadedName = res.data.name || excelName.value.trim()
+      closeExcelModal()
     } else if (res.error) {
       excelError.value = res.error.message
     } else {
@@ -120,10 +75,6 @@ async function submitExcel() {
     excelError.value = String(e)
   } finally {
     excelSubmitting.value = false
-    if (uploadedName) {
-      showSuccess(`数据集已上传：${uploadedName}`)
-      closeExcelModal()
-    }
   }
 }
 
@@ -199,8 +150,6 @@ async function submitSql() {
       </div>
     </header>
 
-    <div v-if="successMessage" class="success-banner">{{ successMessage }}</div>
-
     <section class="card">
       <div v-if="store.loading" class="hint">加载中…</div>
       <div v-else-if="store.datasets.length === 0" class="hint empty">
@@ -246,25 +195,11 @@ async function submitSql() {
             <label class="form-label">选择文件</label>
             <div class="file-upload-area" @click="triggerExcelFileSelect">
               <template v-if="excelFile">
-                <div class="attachment-chip" @click.stop>
-                  <span class="attachment-icon excel">X</span>
-                  <div class="attachment-meta">
-                    <span class="attachment-name" :title="excelFile.name">{{ excelFile.name }}</span>
-                    <span class="attachment-size">{{ formatFileSize(excelFile.size) }} · Excel 表格</span>
-                  </div>
-                  <button
-                    type="button"
-                    class="attachment-remove"
-                    aria-label="移除附件"
-                    title="移除附件"
-                    @click="removeExcelFile"
-                  >
-                    ×
-                  </button>
-                </div>
+                <span class="file-name">{{ excelFile.name }}</span>
+                <span class="file-size">{{ (excelFile.size / 1024).toFixed(1) }} KB</span>
               </template>
               <template v-else>
-                <span class="file-placeholder">点击选择 .xlsx / .xls 文件</span>
+                <span class="file-placeholder">点击选择 .xlsx 文件</span>
               </template>
             </div>
             <input
@@ -287,10 +222,6 @@ async function submitSql() {
               rows="3"
               placeholder="简要描述数据集的用途与来源"
             />
-          </div>
-          <div v-if="excelSubmitting" class="uploading-banner">
-            <span class="spinner"></span>
-            <span>正在上传文件，请勿关闭窗口</span>
           </div>
           <div v-if="excelError" class="error-banner">{{ excelError }}</div>
         </div>
@@ -636,13 +567,13 @@ async function submitSql() {
 .file-upload-area {
   border: 1px dashed var(--color-primary-border);
   border-radius: 10px;
-  padding: 16px;
+  padding: 18px;
+  text-align: center;
   cursor: pointer;
   transition: border-color 0.15s, background 0.15s;
   display: flex;
-  align-items: center;
-  justify-content: center;
-  min-height: 68px;
+  flex-direction: column;
+  gap: 4px;
 }
 
 .file-upload-area:hover {
@@ -653,75 +584,17 @@ async function submitSql() {
 .file-placeholder {
   color: var(--color-text-medium);
   font-size: 13px;
-  text-align: center;
 }
 
-.attachment-chip {
-  display: inline-flex;
-  align-items: center;
-  gap: 8px;
-  padding: 6px 6px 6px 8px;
-  border: 1px solid var(--color-primary-border);
-  border-radius: 10px;
-  background: var(--color-primary-light);
-  max-width: 100%;
-}
-
-.attachment-icon {
-  width: 28px;
-  height: 28px;
-  border-radius: 6px;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  color: #fff;
-  font-size: 13px;
-  font-weight: 700;
-  flex-shrink: 0;
-}
-.attachment-icon.excel { background: #16803d; }
-
-.attachment-meta {
-  display: flex;
-  flex-direction: column;
-  min-width: 0;
-  gap: 1px;
-  text-align: left;
-}
-
-.attachment-name {
-  font-size: 13px;
-  font-weight: 600;
+.file-name {
   color: var(--color-text-dark);
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  max-width: 320px;
+  font-weight: 600;
+  font-size: 13px;
 }
 
-.attachment-size {
-  font-size: 11.5px;
-  color: var(--color-text-medium);
-}
-
-.attachment-remove {
-  flex-shrink: 0;
-  width: 20px;
-  height: 20px;
-  border-radius: 4px;
-  border: 0;
-  background: transparent;
-  color: var(--color-text-medium);
-  font-size: 16px;
-  line-height: 1;
-  cursor: pointer;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-}
-.attachment-remove:hover {
-  background: rgba(143, 107, 255, 0.12);
-  color: var(--color-primary);
+.file-size {
+  color: var(--color-text-light);
+  font-size: 12px;
 }
 
 .error-banner {
@@ -731,42 +604,5 @@ async function submitSql() {
   color: var(--color-error);
   border-radius: 8px;
   font-size: 13px;
-}
-
-.uploading-banner {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  padding: 10px 12px;
-  background: var(--color-primary-light);
-  border: 1px solid var(--color-primary-border);
-  color: var(--color-primary);
-  border-radius: 8px;
-  font-size: 13px;
-}
-
-.spinner {
-  width: 14px;
-  height: 14px;
-  border: 2px solid var(--color-primary-light);
-  border-top-color: var(--color-primary);
-  border-radius: 50%;
-  display: inline-block;
-  flex-shrink: 0;
-  animation: spin 0.8s linear infinite;
-}
-
-@keyframes spin {
-  to { transform: rotate(360deg); }
-}
-
-.success-banner {
-  padding: 10px 14px;
-  background: #ecfdf3;
-  border: 1px solid #abefc6;
-  color: #067647;
-  border-radius: 10px;
-  font-size: 13px;
-  font-weight: 600;
 }
 </style>

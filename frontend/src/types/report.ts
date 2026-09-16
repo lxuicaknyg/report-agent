@@ -50,13 +50,19 @@ export interface ReportGlobalContext {
   dimensions: Record<string, string>
 }
 
+export interface SubchapterPlan {
+  section_id: string
+  title: string
+  level: number
+}
+
 export interface ChapterPlan {
   section_id: string
   title: string
+  level: number
   metrics: string[]
-  order?: number
+  subsections: SubchapterPlan[]
 }
-
 
 export interface DataSourceMetadata {
   dataset_id: string
@@ -72,12 +78,17 @@ export interface DataSourceMetadata {
 export interface UserQuestion {
   question_id: string
   chapter_id?: string | null
+  chapter_title?: string | null
+  metric?: string | null
+  expected?: 'value' | 'dataset' | 'text'
   content: string
   reason?: string | null
   required?: boolean
-  answer?: string | null
+  resolution?: 'pending' | 'value' | 'sql' | 'dropped'
+  value?: string | null
+  note?: string | null
   created_at: string
-  answered_at?: string | null
+  resolved_at?: string | null
 }
 
 export interface ChapterDraft {
@@ -121,10 +132,12 @@ export interface ReportGenerationSession {
   current_step?: string | null
   current_chapter_id?: string | null
   template_snapshot?: ReportTemplate | null
+  data_source_metadata?: DataSourceMetadata[]
   plan?: ReportPlan | null
   chapter_drafts?: Record<string, ChapterDraft>
   pending_questions?: UserQuestion[]
-  answers?: Record<string, string>
+  resolved_questions?: UserQuestion[]
+  dropped_metrics?: Record<string, string[]>
   assembled_report?: AssembledReport | null
   artifacts?: ReportArtifact[]
   error?: string | null
@@ -132,38 +145,6 @@ export interface ReportGenerationSession {
   updated_at: string
 }
 
-export interface CreateReportGenerationRequest {
-  template_id: string
-  dataset_ids: string[]
-  instruction: string
-  title?: string | null
-  auto_start?: boolean
-}
 
-export interface AnswerReportQuestionRequest {
-  question_id: string
-  answer: string
-  auto_resume?: boolean
-}
 
-export interface ConfirmReportPlanRequest {
-  title?: string | null
-  report_period?: string | null
-  dimensions?: Record<string, string>
-  chapters?: Array<{
-    section_id: string
-    title: string
-    metrics: string[]
-  }>
-}
 
-export interface LegacyProfileReportResponse {
-  report: {
-    title: string
-    executive_summary: string
-    sections?: Record<string, unknown>[]
-    evidence?: Evidence[]
-    format?: 'markdown' | 'html'
-  }
-  markdown: string
-}

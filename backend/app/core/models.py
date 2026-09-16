@@ -33,8 +33,62 @@ class ColumnSchema(BaseModel):
 
 class SheetInfo(BaseModel):
     sheet_name: str
+    #: The identifier this sheet is queryable as in SQL. Spelled out rather
+    #: than derived, so nothing downstream has to guess at quoting rules.
+    table_name: str | None = None
     columns: list[ColumnSchema] = Field(default_factory=list)
     row_count: int | None = None
+
+
+#: What an aggregation may ask a column for. Deliberately small: the model
+#: picks one of these, it does not describe a calculation.
+AggregateFunction = Literal["sum", "count", "count_distinct", "avg", "min", "max"]
+
+#: How a filter compares a column to a value. No expressions, no arithmetic.
+FilterOperator = Literal["eq", "ne", "in", "between", "gte", "lte", "contains"]
+
+
+class AggregateFilter(BaseModel):
+    column: str
+    op: FilterOperator = "eq"
+    #: A single value, or the list/pair that ``in`` and ``between`` need.
+    value: Any = None
+
+
+class AggregateMetric(BaseModel):
+    column: str
+    function: AggregateFunction
+    #: What the result column is called; defaults to ``function_column``.
+    alias: str | None = None
+
+
+class AggregateRequest(BaseModel):
+    """A slot-filling aggregation: pick a sheet, columns and a function.
+
+    The model never writes the calculation, only says which column to total and
+    how to slice it. Everything arithmetic happens here, so a metric cannot be
+    wrong because the model added six numbers up in its head — and cannot be
+    surprising because the model wrote its own query.
+    """
+
+    sheet_name: str | None = None
+    filters: list[AggregateFilter] = Field(default_factory=list)
+    group_by: list[str] = Field(default_factory=list)
+    metrics: list[AggregateMetric] = Field(default_factory=list)
+    order_by: str | None = None
+    descending: bool = True
+    limit: int = Field(default=100, ge=1, le=1000)
+
+
+class AggregateResult(BaseModel):
+    dataset_id: str
+    sheet_name: str
+    columns: list[str] = Field(default_factory=list)
+    rows: list[dict[str, Any]] = Field(default_factory=list)
+    row_count: int = 0
+    #: Rows the filters matched before grouping — the denominator a reader
+    #: needs to tell "no matching data" from "everything summed to zero".
+    matched_rows: int = 0
 
 
 class DataReadRequest(BaseModel):
@@ -86,7 +140,7 @@ class QueryResult(BaseModel):
 
 class Evidence(BaseModel):
     evidence_id: str
-    kind: Literal["dataset", "query", "research", "calculation"]
+    kind: Literal["dataset", "query", "research", "calculation", "generated_sql"]
     title: str
     source: str
     value: Any = None

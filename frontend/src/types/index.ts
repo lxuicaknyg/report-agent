@@ -26,33 +26,31 @@ export type {
   ReportPlan,
   ReportGlobalContext,
   ChapterPlan,
+  SubchapterPlan,
   DataSourceMetadata,
   UserQuestion,
   ChapterDraft,
   AssembledReport,
   ReportArtifact,
   ReportGenerationSession,
-  CreateReportGenerationRequest,
-  AnswerReportQuestionRequest,
-  ConfirmReportPlanRequest,
-  LegacyProfileReportResponse,
 } from './report'
 
-export type { ConversationSession, Turn } from './conversation'
 export type {
-  TaskStatus,
-  StepStatus,
-  PlanStatus,
-  TaskStep,
-  ExecutionPlan,
-  Task,
-  PlanResponse,
-  PlanStepResponse,
-  TaskResult,
-  TaskReportResponse,
-} from './task'
-export { TASK_EVENT_NAMES } from './events'
-export type { TaskEvent, TaskEventName, SSEConnectionState } from './events'
+  MessageRole,
+  MessageKind,
+  AttachmentKind,
+  MessageAttachment,
+  PlanMessagePayload,
+  ProgressChapter,
+  ChapterProgressStatus,
+  QuestionResolutionInput,
+  QuestionMessagePayload,
+  ProgressMessagePayload,
+  ReportMessagePayload,
+  Message,
+  Conversation,
+  ConversationDetail,
+} from './conversation'
 
 export interface ApiErrorInfo {
   code: string
@@ -65,3 +63,13 @@ export interface ApiResult<T> {
   data?: T | null
   error?: ApiErrorInfo
 }
+
+export type {
+  ConnectionDriver,
+  ConnectionStatus,
+  DriverExtraField,
+  DriverSpec,
+  DataConnection,
+  ConnectionInput,
+  ConnectionTestResult,
+} from './connection'

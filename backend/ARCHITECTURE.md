@@ -1,645 +1,331 @@
 # Report Agent Backend 架构文档
 
-本文档描述当前 `backend` 的实际代码架构、运行时组装关系、报告生成流程，以及新增 Agent 时应如何扩展。文档以当前代码为准；尚未实现的能力会明确标注为规划项。
+本文档描述 `backend` 的实际代码架构、运行时装配关系、报告生成流程，以及新增能力时的扩展方式。文档以当前代码为准；未实现的能力明确标注为规划项，规划项集中在 [../ROADMAP.md](../ROADMAP.md)。
 
 ## 1. 项目定位
 
-本项目是一个面向“报告生成”业务的后端原型，不是通用 Agent 平台。核心业务链路是：
+面向「报告生成」业务的后端，不是通用 Agent 平台。核心链路：
 
 ```text
 数据源 + 报告模板 + 用户指令
               ↓
-      报告生成会话
+        对话（唯一写入通道）
               ↓
-       模板解析与计划
+       模板解析 → 章节树 → 报告计划
               ↓
-        逐章研究和写作
+        逐章取数和写作
               ↓
        报告组装与文件渲染
 ```
 
-当前系统同时提供两条能力链路：
+两条能力链路并存：
 
-1. 数据集管理和确定性分析：注册 Excel/SQL 数据源、查看 Schema、Profile、执行只读查询。
-2. 报告生成：上传模板、创建会话、逐章读取数据和写作、处理用户追问、生成 Markdown 产物。
+1. **数据集管理与确定性分析**：注册 Excel/SQL 数据源、查看 Schema、Profile、执行只读查询。
+2. **报告生成**：全部通过对话驱动。
 
-当前默认的报告章节 Writer 是 `ChapterWriterAgent`。它使用 OpenAI-compatible LLM，在每个章节中先进行有界的只读取数循环，再进行一次无工具写作调用。`StubChapterWriter` 仅用于外围流程测试。
+### 一条不可协商的约束
+
+**对话是唯一的写入通道。**`POST /conversations/{id}/messages` 是系统唯一的写接口。所有状态迁移——创建报告、修改计划、确认开工、补充数据——都由 `ConversationOrchestrator` 根据会话当前状态判定意图后触发。
+
+这条约束的直接后果：
+
+- `/reports` 下**没有任何写接口**，只有读和下载。
+- 前端不做业务分支，只按 `message.kind` 选渲染组件。
+- 计划、进度、追问都是消息，因此天然有历史、可回看、可持久化。
+
+早期版本曾提供表单式的 `POST /reports`、`/plan/confirm`、`/answers`、`/resume`，已全部移除。
 
 ## 2. 分层架构
 
 ```text
-┌────────────────────────────────────────────────────────────┐
-│ API 层：FastAPI routes                                     │
-│ 请求校验、HTTP 状态码、文件上传和下载                       │
-└────────────────────────────┬───────────────────────────────┘
-                             │
-┌────────────────────────────▼───────────────────────────────┐
-│ 应用/业务编排层                                             │
-│ ReportGenerationService / AnalysisAgent                    │
-└───────────────┬───────────────────────┬────────────────────┘
-                │                       │
-┌───────────────▼──────────────┐ ┌──────▼────────────────────┐
-│ 报告领域模型与端口 core       │ │ 数据访问与工具             │
-│ Session/Plan/Draft/Ports      │ │ DataCatalog/Tools         │
-└───────────────┬──────────────┘ └──────┬────────────────────┘
-                │                       │
-┌───────────────▼───────────────────────▼────────────────────┐
-│ reporting / data / infrastructure                           │
-│ 模板解析、章节 Agent、Renderer、数据源、LLM、仓储和存储       │
-└────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────┐
+│ API 层：FastAPI routes                                        │
+│ 请求校验、HTTP 状态码、文件上传下载；不含业务逻辑              │
+└───────────────────────────┬──────────────────────────────────┘
+                            │
+┌───────────────────────────▼──────────────────────────────────┐
+│ 对话层：app/conversations          ★ 唯一写入路径              │
+│ ConversationOrchestrator：意图路由 → 调用报告服务 → 产出消息   │
+└───────────────────────────┬──────────────────────────────────┘
+                            │
+┌───────────────────────────▼──────────────────────────────────┐
+│ 报告业务层：app/reporting                                     │
+│ ReportGenerationService（整份报告生命周期）                    │
+│ TemplateParser / Planner / ChapterWriterAgent / Assembler     │
+└──────────────┬───────────────────────────┬───────────────────┘
+               │                           │
+┌──────────────▼──────────────┐ ┌──────────▼───────────────────┐
+│ 领域模型与端口 app/core      │ │ 数据访问与工具                │
+│ Conversation/Message         │ │ DataCatalog / ToolRegistry   │
+│ Session/Plan/Draft/Ports     │ │ Excel / SQL 数据源           │
+└──────────────┬──────────────┘ └──────────┬───────────────────┘
+               │                           │
+┌──────────────▼───────────────────────────▼───────────────────┐
+│ app/infrastructure：LLM 适配、日志、仓储、产物存储             │
+└──────────────────────────────────────────────────────────────┘
 ```
 
 设计约束：
 
-- API 层不直接实现取数、Prompt 或报告组装逻辑。
+- API 层不实现取数、Prompt 或报告组装。
+- 对话层决定「这条消息意味着什么」；报告层决定「怎么做」。两者不互相越界：orchestrator 不碰模板解析，报告服务不认识消息。
 - `ReportGenerationService` 负责整份报告的生命周期；章节 Agent 只负责一个章节。
-- 数据源通过 `DataCatalog` 暴露，Agent 不应直接依赖 `openpyxl`、SQLAlchemy 等具体库。
-- LLM、ArtifactStore、仓储等可替换组件通过 `core/ports.py` 定义接口。
-- `dependencies.py` 是默认运行时装配点；增加实现后必须在这里显式接入。
+- 数据源通过 `DataCatalog` 暴露，Agent 不直接依赖 `openpyxl`、SQLAlchemy。
+- LLM、ArtifactStore、仓储通过 `core/ports.py` 与 `*/repository.py` 定义接口。
+- `dependencies.py` 是唯一的运行时装配点。
 
 ## 3. 目录结构
 
 ```text
-backend/
-├── app/
-│   ├── __init__.py
-│   ├── main.py
-│   ├── config.py
-│   ├── dependencies.py
-│   │
-│   ├── api/
-│   │   ├── __init__.py
-│   │   └── routes/
-│   │       ├── __init__.py
-│   │       ├── health.py
-│   │       ├── datasets.py
-│   │       ├── analysis.py
-│   │       └── reports.py
-│   │
-│   ├── core/
-│   │   ├── __init__.py
-│   │   ├── models.py
-│   │   ├── reports.py
-│   │   ├── ports.py
-│   │   ├── tooling.py
-│   │   └── agent.py
-│   │
-│   ├── data/
-│   │   ├── __init__.py
-│   │   ├── catalog.py
-│   │   └── sources/
-│   │       ├── __init__.py
-│   │       ├── base.py
-│   │       ├── excel.py
-│   │       └── sql.py
-│   │
-│   ├── analysis/
-│   │   ├── __init__.py
-│   │   └── agent.py
-│   │
-│   ├── reporting/
-│   │   ├── __init__.py
-│   │   ├── reports.py
-│   │   ├── report_generation.py
-│   │   ├── session.py
-│   │   ├── template_parser.py
-│   │   ├── planner.py
-│   │   ├── chapter_writer.py
-│   │   ├── chapter_writer_agent.py
-│   │   ├── assembler.py
-│   │   └── renderer.py
-│   │
-│   ├── tools/
-│   │   ├── __init__.py
-│   │   └── dataset_tools.py
-│   │
-│   └── infrastructure/
-│       ├── __init__.py
-│       ├── llm.py
-│       ├── users.py
-│       ├── report_repositories.py
-│       └── artifact_store.py
+backend/app/
+├── main.py                            创建 FastAPI 应用，注册路由
+├── config.py                          .env → Settings
+├── dependencies.py                    lru_cache 单例装配
 │
-├── example/
-├── tests/
-├── requirements.txt
-├── requirements-dev.txt
-└── README.md
+├── api/routes/
+│   ├── health.py
+│   ├── conversations.py               唯一写入口所在
+│   ├── reports.py                     只读
+│   ├── datasets.py
+│   └── analysis.py
+│
+├── conversations/                     ★ 对话层
+│   ├── orchestrator.py                意图路由与消息产出
+│   └── repository.py                  ConversationRepository 抽象
+│
+├── core/                              领域模型与端口，无 IO
+│   ├── conversations.py               Conversation / Message / MessageIntent
+│   ├── reports.py                     报告全部模型 + group_template_chapters
+│   ├── models.py                      通用模型、Evidence、RequestContext
+│   ├── ports.py                       DataSource / LlmService / ArtifactStore / UserResolver
+│   ├── tooling.py                     Tool / ToolContext / ToolResult / ToolRegistry
+│   └── agent.py                       通用工具调用循环（底层可复用能力）
+│
+├── reporting/
+│   ├── report_generation.py           ReportGenerationService
+│   ├── template_parser.py             文档 → ReportTemplate（含表格）
+│   ├── planner.py                     ReportPlan 生成与自然语言修订
+│   ├── chapter_writer.py              ChapterWriter 接口 + StubChapterWriter
+│   ├── chapter_writer_agent.py        两阶段章节 Agent
+│   ├── assembler.py                   ChapterDraft → AssembledReport
+│   ├── renderer.py                    AssembledReport → Markdown
+│   ├── session.py                     报告与模板仓储接口
+│   └── reports.py                     旧版 ReportService（当前无调用方）
+│
+├── data/
+│   ├── catalog.py                     dataset_id → RegisteredDataSource
+│   └── sources/{base,excel,sql}.py
+│
+├── tools/dataset_tools.py             只读数据工具
+│
+├── analysis/agent.py                  AnalysisAgent（确定性分析链路）
+│
+└── infrastructure/
+    ├── llm.py                         OpenAI-compatible 适配 + 调用日志
+    ├── logging.py                     文件 + 控制台日志，preview() 截断
+    ├── conversation_repositories.py   会话/消息：内存 + 文件持久化
+    ├── report_repositories.py         报告会话：内存 + 文件持久化；模板：内存
+    ├── artifact_store.py              内存产物存储
+    └── users.py                       LocalUserResolver
 ```
 
-## 4. 文件职责
+> `app/analysis/` 下除 `agent.py` 外还残留 8 个与 `app/reporting/` 重复的模块（assembler、planner、renderer 等），是目录重构未收尾的产物，**当前无任何引用**。见 ROADMAP 的清理项。
 
-### 4.1 应用入口与装配
+## 4. 对话层
 
-#### `app/__init__.py`
+### 4.1 消息模型
 
-Python 包标记文件，没有业务逻辑。
+```python
+class Message:
+    message_id, conversation_id
+    role: "user" | "assistant"
+    kind: "text" | "plan" | "progress" | "question" | "report" | "error"
+    content: str                 # 给人看的自然语言
+    payload: dict                # 给 UI 渲染的结构化数据
+    attachments: list[MessageAttachment]
 
-#### `app/main.py`
+class Conversation:
+    conversation_id, user_id, title
+    report_session_id: str | None    # 一个会话最多一份报告
+```
 
-创建 FastAPI 应用并注册路由：
+`kind` 是前后端的渲染契约：`plan` 的 payload 装完整 `ReportPlan`，`progress` 装章节完成度，`question` 装按章节分组的待补充项，`report` 装产物列表。
 
-- `/health`
-- `/api/v1/datasets/*`
-- `/api/v1/analysis/*`
-- `/api/v1/reports/*`
+### 4.2 意图路由
 
-该文件只负责应用入口和路由挂载，不应放置业务流程。
+`ConversationOrchestrator._classify` 按会话当前状态收敛候选意图，再交给模型判定；模型不可用时退回关键词规则：
 
-#### `app/config.py`
+| 会话状态 | 候选意图 |
+|---|---|
+| 消息带模板 + 数据附件 | `create`（无条件） |
+| 无报告会话 | `chat` |
+| `plan.status == awaiting_confirmation` | `approve_plan` / `revise_plan` / `chat` |
+| `waiting_user` 且有待答问题 | `answer` / `chat` |
+| 其他 | `chat` |
 
-读取应用配置和 LLM 配置：
+### 4.3 消息处理的两段式
 
-- `APP_NAME`
-- `ENVIRONMENT`
-- `API_PREFIX`
-- `DATA_DIR`
-- `ARTIFACT_DIR`
-- `DATABASE_URL`
-- `LLM_BASE_URL`
-- `LLM_API_KEY`
-- `LLM_MODEL_NAME`
+```python
+submit_message()    # 同步：解析 docx 存模板、注册 Excel、落 user message
+                    # 坏文件当场 400，请求即返回
+process_message()   # 后台 asyncio 任务：意图判定 → 调用报告服务 → 产出助手消息
+```
 
-模块会尝试加载 `backend/.env`。仓库只提交 `.env.example`，真实密钥不应提交到 Git。
+上传解析放在同步段，是为了让文件错误立刻反馈；模型工作放在后台段，是为了让输入框不被几分钟的生成阻塞。
 
-#### `app/dependencies.py`
+## 5. 报告领域模型
 
-默认依赖注入和单例装配中心，当前装配：
+### 5.1 章节树
+
+模板解析产出的是**扁平的标题列表**（忠实于文档），`group_template_chapters` 把它归组成章节树：
+
+```python
+class TemplateChapter:
+    root: ReportTemplateSection          # 顶级标题
+    subsections: list[ReportTemplateSection]   # 其下所有更深的标题
+```
+
+归组规则：最浅的标题层级起一章，更深的挂到上一章。正文前言（`metadata.preamble`）自成一章且不参与层级基准计算。
+
+**章节是取数、写作和渲染的统一单位**：一次 agent 运行写完整章（含 H3 子节），渲染时章节固定输出 `##`，子节按相对深度输出 `###` / `####`。
+
+### 5.2 报告计划
+
+```python
+class ChapterPlan:
+    section_id, title
+    level: int                       # 来自模板，模型不可修改
+    metrics: list[str]               # 覆盖本章及其全部子节
+    subsections: list[SubchapterPlan]
+
+class ReportPlan:
+    plan_id, version, status
+    title, instruction
+    global_context: ReportGlobalContext    # report_period + dimensions
+    chapters: list[ChapterPlan]
+    assembly_order: list[str]
+```
+
+计划**只表达业务意图**：规划阶段禁止确定 Sheet、表名、字段名、SQL 或工具调用顺序。这条约束让计划成为一个不懂表结构也能修改的对象。
+
+模型返回的计划一律经 `_parse_plan_payload` 校验：`section_id` 必须存在于模板、子节必须属于本章、指标必须是字符串数组、层级一律从模板取。首次规划要求覆盖整棵树，修订允许两级子集与重排——所以「去掉某一章」会连带去掉它的子节，不会留下孤儿。
+
+### 5.3 会话状态
 
 ```text
-DataCatalog
-  └── ToolRegistry
-        ├── ListDatasetsTool
-        ├── ProfileDatasetTool
-        ├── QueryDatasetTool
-        ├── ListSheetsTool
-        └── ReadDatasetTool
-
-ReportGenerationService
-  ├── InMemoryReportSessionRepository
-  ├── InMemoryReportTemplateRepository
-  ├── ReportTemplateParser
-  ├── ReportPlanner
-  ├── ChapterWriterAgent
-  ├── ReportAssembler
-  ├── MarkdownReportRenderer
-  ├── InMemoryArtifactStore
-  └── DataCatalog
+created → awaiting_confirmation ⇄ (revise_plan)
+              ↓ approve_plan
+           running ⇄ waiting_user
+              ↓
+          completed / failed / cancelled
 ```
 
-使用 `lru_cache` 提供进程级单例。替换真实 LLM、数据库仓储、对象存储或 Writer 时，优先修改此文件。
+`waiting_user` 的语义是「停着等人补数据」，不是「进行中」——所以进程重启时**不对账**它。
 
-### 4.2 API 层：`app/api`
+## 6. 章节 Agent
 
-#### `app/api/routes/health.py`
+`ChapterWriterAgent` 两阶段，参数 `max_iterations=8`、`max_retries_per_error=2`、`max_rows_per_read=100`：
 
-提供 `GET /health`，用于服务存活检查。
+**阶段一 · 取数（有界 ReAct）**
 
-#### `app/api/routes/datasets.py`
+只暴露 `read_dataset` / `query_dataset` 两个只读工具。`_execute_read_tool` 做三层校验：数据集必须在本次会话白名单内；按数据源类型强制工具匹配（Excel 用 `read_dataset`，SQL 用 `query_dataset`）；行数上限。工具报错回喂给模型让它改参数，同类错误超过上限才放弃。
 
-数据源接口：
+**阶段二 · 写作（无工具）**
+
+输入是章节模板原文（含 Markdown 化的表格）、子节列表及其应输出的 heading 行、计划指标、全局上下文、全部成功读取的数据。
+
+几条来自实测的硬约束：
+
+- **questions 非空即视为需要补充数据**，不依赖模型把 `status` 设对——实测中模型经常一边在正文写"待补充后再计算"、一边把状态标成 `completed`，导致请求被静默丢弃。
+- `waiting_user` 但没给出任何问题时，用章节计划的指标兜底生成一条，**绝不让会话静默挂起**。
+- `chapter_plan.metrics` 为空的叙述性章节（前言、数据来源说明）不允许因缺数据提问。
+- 表格必须写在 `content` 里。`ChapterDraft.tables` 字段渲染器不消费，模型把表放进去就等于丢弃。
+
+## 7. 实际运行流程
 
 ```text
-GET  /api/v1/datasets
-POST /api/v1/datasets/excel
-POST /api/v1/datasets/sql
-GET  /api/v1/datasets/{dataset_id}/sheets
-GET  /api/v1/datasets/{dataset_id}/schema
-POST /api/v1/datasets/{dataset_id}/preview
+POST /conversations/{id}/messages  (multipart: text + template_file + data_file)
+  │
+  ├─ submit_message         upload_template / register_excel_dataset / 落 user message
+  │                         ← 立即返回
+  └─ process_message（后台）
+       ├─ _classify → create
+       └─ create_session
+            └─ _prepare_plan
+                 解析模板快照 → 数据源元数据（含前 5 行样例）→ planner.create_plan
+                 status = awaiting_confirmation，产出 kind="plan" 消息
+
+（用户说"去掉风险章节"）→ revise_plan → version+1 → 新的 kind="plan" 消息
+（用户说"确认，开始生成"）→ approve_plan → start → _continue
+
+_continue：
+  for chapter in plan.chapters:
+      已有 draft → 跳过
+      落盘 current_chapter_id（否则外部观察不到"哪一章在跑"）
+      ChapterWriterAgent.write(章节 + 子节 + 指标 + 数据源)
+        ├─ waiting_user → 记录问题（带 metric/expected/chapter_title）
+        │                 status = waiting_user，**就地返回**，后续章节不启动
+        └─ completed  → 存 draft、落盘 → 前端 2s 内可见该章正文
+  全部完成 → assemble → render → ArtifactStore → kind="report" 消息
 ```
 
-负责文件上传、SQL 数据源注册、Schema 和预览请求的 HTTP 适配。实际访问由 `DataCatalog` 完成。
+补充数据后 `answer_question` 消费问题，全部答齐则自动 `start` 恢复：重跑当前章，再继续下一章。重试前会清掉该章的历史问题，避免重复堆积。
 
-#### `app/api/routes/analysis.py`
+## 8. 扩展方式
 
-提供：
+### 8.1 新增章节 Writer
 
-```text
-POST /api/v1/analysis/profile
-POST /api/v1/analysis/query
-```
-
-当前分析接口是确定性的：调用方提供 `dataset_id`，查询接口提供只读 SQL；这里还没有自然语言转 SQL。
-
-#### `app/api/routes/reports.py`
-
-新报告流程接口：
-
-```text
-POST /api/v1/reports/templates
-GET  /api/v1/reports/templates/{template_id}
-POST /api/v1/reports
-GET  /api/v1/reports/{session_id}
-POST /api/v1/reports/{session_id}/answers
-POST /api/v1/reports/{session_id}/resume
-GET  /api/v1/reports/{session_id}/artifacts/{artifact_id}
-```
-
-此外保留：
-
-```text
-POST /api/v1/reports/draft
-```
-
-该旧接口只生成基于 Profile 的兼容性报告，不走新的模板和章节 Agent 流程。
-
-### 4.3 领域层：`app/core`
-
-#### `app/core/models.py`
-
-通用领域模型，包括：
-
-- `User`、`RequestContext`
-- `ColumnSchema`、`SheetInfo`
-- `DataReadRequest`、`DataReadResult`
-- `DatasetInfo`、`DatasetProfile`、`QueryResult`
-- `Evidence`
-- `AnalysisRequest`、`AnalysisResult`
-- 旧版 `ReportDraft`
-
-这些模型不应依赖 FastAPI 或具体数据库实现。
-
-#### `app/core/reports.py`
-
-报告生成领域契约，包括：
-
-- `ReportGenerationStatus`：`created`、`running`、`waiting_user`、`completed`、`failed`、`cancelled`
-- `ReportTemplate`、`ReportTemplateSection`
-- `ReportPlan`
-- `DataSourceMetadata`
-- `ChapterWriterInput`、`ChapterWriterResult`
-- `ChapterDraft`
-- `AssembledReport`
-- `ReportArtifact`
-- `UserQuestion`
-- `ReportGenerationSession`
-- 创建会话和回答问题的请求模型
-
-这是报告模块的稳定边界。新增 Agent 应优先复用这些契约，而不是自行创建相似的字典结构。
-
-当前 `ReportTemplateSection` 有 `level` 字段，但没有 `parent_section_id` 或 `children`；因此多级标题目前只能被识别层级，计划和组装仍是扁平章节列表。
-
-#### `app/core/ports.py`
-
-定义可替换接口：
-
-- `DataSource`
-- `LlmService`
-- `ArtifactStore`
-- `UserResolver`
-
-业务层依赖这些抽象，不应直接依赖 OpenAI SDK、S3 SDK 或具体数据库客户端。
-
-#### `app/core/tooling.py`
-
-定义工具系统：
-
-- `ToolContext`：请求用户、会话和权限上下文
-- `ToolResult`：成功标志、给模型的摘要、结构化数据、错误和证据
-- `Tool`：工具名称、描述、参数 Schema 和执行方法
-- `ToolRegistry`：注册、列举 Schema、权限检查和调用
-
-#### `app/core/agent.py`
-
-提供通用的 `ToolCallingAgent` 工具调用循环。它是基础能力，不负责报告会话、模板或 Artifact 生命周期。新的通用工具调用型 Agent 可以复用它，但章节报告流程仍应实现 `ChapterWriter` 接口。
-
-### 4.4 数据层：`app/data`
-
-#### `app/data/catalog.py`
-
-`DataCatalog` 维护：
-
-```text
-dataset_id → RegisteredDataSource
-```
-
-统一提供数据集列表、Schema、Sheet、行读取、Profile 和查询能力，是上层访问数据源的唯一入口。
-
-#### `app/data/sources/base.py`
-
-定义 `RegisteredDataSource` 抽象接口。新增数据源类型时，应实现该接口，而不是修改报告 Agent 让它直接读取新格式。
-
-#### `app/data/sources/excel.py`
-
-`ExcelDataSource`：
-
-- 使用 `openpyxl` 只读模式读取 `.xlsx`
-- 支持多 Sheet
-- 支持 Schema、分页行读取、列选择和精确筛选
-- 支持 Profile
-- 保留显式 SQL 查询兼容路径，懒加载 DuckDB/SQLite
-
-#### `app/data/sources/sql.py`
-
-`SqlDataSource` 使用 SQLAlchemy 连接外部数据库，提供表 Schema、Profile 和只读 `SELECT`/`WITH` 查询。
-
-当前 Excel 和 SQL 数据源分别执行查询，不支持跨数据源 JOIN。
-
-### 4.5 分析层：`app/analysis`
-
-#### `app/analysis/agent.py`
-
-`AnalysisAgent` 是面向数据分析 API 的轻量应用服务：
-
-- `profile()` 调用 Profile 工具
-- `query()` 调用只读查询工具
-
-它与报告生成流程相互独立。后续可以被报告 Writer 复用，但不应让它接管报告会话生命周期。
-
-### 4.6 报告层：`app/reporting`
-
-#### `app/reporting/template_parser.py`
-
-`ReportTemplateParser` 将 DOCX/Markdown/TXT 转为 `ReportTemplate`。
-
-- DOCX：读取 `word/document.xml`，识别 Title、Heading1-6 和普通段落
-- Markdown：识别 `#` 到 `######`
-- TXT：识别普通文本和简单编号标题
-
-当前重点是语义结构，不是样式克隆。复杂表格、图片、字体、颜色和版式尚未保真保存。
-
-#### `app/reporting/planner.py`
-
-`ReportPlanner` 当前是确定性计划器：按 `order` 排序并生成 `assembly_order`。它不会自动拆解指标、生成数据查询任务，也不会建立多级章节父子关系。
-
-#### `app/reporting/chapter_writer.py`
-
-定义稳定的章节 Writer 接口：
+实现 `ChapterWriter` 接口，在 `dependencies.get_report_generation_service` 里替换 `writer=`：
 
 ```python
 class ChapterWriter(ABC):
-    async def write(
-        self,
-        input: ChapterWriterInput,
-        session: ReportGenerationSession,
-    ) -> ChapterWriterResult:
-        ...
+    async def write(self, input: ChapterWriterInput, session) -> ChapterWriterResult: ...
 ```
 
-同时提供 `StubChapterWriter`，用于不依赖 LLM 的外围流程测试。
+`ChapterWriterInput` 提供章节模板、子节列表、计划指标、全局上下文、数据源元数据、用户指令和历史回答。返回 `completed`（带 `ChapterDraft`）、`waiting_user`（带 `questions`）或 `failed`。外围流程不关心内部是 ReAct、单次调用还是纯规则。
 
-#### `app/reporting/chapter_writer_agent.py`
+### 8.2 新增数据工具
 
-当前默认章节 Agent，分为两阶段：
+实现 `core/tooling.Tool`，在 `dependencies.get_registry` 注册。若要让章节 Agent 用到，还需加入 `ChapterWriterAgent._read_tool_names`——该集合是取数阶段的白名单。
 
-1. 研究阶段：只开放 `read_dataset` 和 `query_dataset`，限制数据集范围、循环次数和读取行数；工具错误会反馈给模型修正。
-2. 写作阶段：关闭工具，将章节模板、用户指令、历史回答和已收集数据交给 LLM，生成 `ChapterDraft`。
+### 8.3 新增 Renderer / 仓储 / LLM
 
-读取结果中的 `Evidence` 会附加到章节和最终报告中。数据不足或模型明确请求补充信息时，返回 `waiting_user`。
+分别实现 `MarkdownReportRenderer` 的同型接口、`*Repository` 抽象、`core/ports.LlmService`，然后在 `dependencies.py` 装配。所有替换点都收敛在这一个文件。
 
-#### `app/reporting/report_generation.py`
+### 8.4 新增消息类型
 
-`ReportGenerationService` 是整份报告的应用服务，负责：
+在 `core/conversations.MessageKind` 增加字面量，在 orchestrator 产出该 kind 的消息，在前端 `ChatPanel` 增加对应渲染组件。**不要**为新交互增加写接口——所有写入都应该经由消息。
 
-1. 上传和保存模板
-2. 校验模板与数据集
-3. 创建/恢复会话
-4. 解析模板并生成计划
-5. 构建数据源元信息
-6. 按计划逐章调用 Writer
-7. 保存章节草稿和中间状态
-8. 处理等待用户、回答和恢复
-9. 组装报告
-10. 渲染并保存 Artifact
-
-已完成的章节会根据 `session.chapter_drafts` 跳过，因此恢复时不会重复生成已完成章节。
-
-#### `app/reporting/assembler.py`
-
-按 `ReportPlan.assembly_order` 排列章节，合并章节证据，生成 `AssembledReport`。不重新取数，也不调用 LLM。
-
-#### `app/reporting/renderer.py`
-
-定义当前 Markdown 渲染实现 `MarkdownReportRenderer`。当前只生成 Markdown；未来可增加 DOCX、HTML、PDF Renderer。
-
-#### `app/reporting/session.py`
-
-定义：
-
-- `ReportSessionRepository`
-- `ReportTemplateRepository`
-- `StoredReportTemplate`
-
-这里是仓储抽象，具体内存实现位于 infrastructure。
-
-#### `app/reporting/reports.py`
-
-旧版 `ReportService`，生成基于 Profile 的 `ReportDraft`，仅为 `/reports/draft` 兼容接口保留。
-
-### 4.7 工具层：`app/tools`
-
-#### `app/tools/dataset_tools.py`
-
-当前工具：
-
-- `ListDatasetsTool`
-- `ListSheetsTool`
-- `ProfileDatasetTool`
-- `QueryDatasetTool`
-- `ReadDatasetTool`
-
-工具统一通过 `DataCatalog` 访问数据，返回 `ToolResult`，并在成功读取时附带 `Evidence`。
-
-### 4.8 基础设施层：`app/infrastructure`
-
-#### `app/infrastructure/llm.py`
-
-`OpenAICompatibleLlmService` 将内部消息和工具 Schema 转换为 OpenAI Chat Completions 请求，兼容 DashScope 等 OpenAI-compatible 服务。
-
-#### `app/infrastructure/users.py`
-
-`LocalUserResolver`，当前返回本地用户上下文。真实认证、JWT、OAuth 和用户隔离应在此层扩展。
-
-#### `app/infrastructure/report_repositories.py`
-
-提供内存版模板仓储和会话仓储。服务重启后数据丢失。
-
-#### `app/infrastructure/artifact_store.py`
-
-提供 `InMemoryArtifactStore`。产物 URI 为 `memory://...`，服务重启后文件不可恢复。
-
-## 5. 当前实际报告生成流程
-
-### 5.1 API 顺序
-
-```text
-1. POST /reports/templates
-2. POST /reports
-3. GET  /reports/{session_id}
-4. （可选）POST /reports/{session_id}/answers
-5. （可选）POST /reports/{session_id}/resume
-6. GET  /reports/{session_id}/artifacts/{artifact_id}
-```
-
-### 5.2 会话状态
-
-```text
-created → running → completed
-              │
-              └→ waiting_user → running
-
-运行异常 → failed
-```
-
-### 5.3 当前计划结构
-
-`ReportPlan` 当前包含：
-
-- `plan_id`
-- `template_id`
-- `title`
-- `instruction`
-- `sections`
-- `assembly_order`
-
-`sections` 是扁平数组。虽然 `ReportTemplateSection.level` 会保留 Heading 层级，但目前没有树形父子关系；多级章节会被逐个当成独立 Writer 任务，Markdown Renderer 也会统一输出二级标题。这是当前架构的已知限制。
-
-## 6. 新增 Agent 的开发方式
-
-先判断新 Agent 属于哪一类：
-
-| 类型 | 推荐位置 | 是否接入报告主流程 |
-| --- | --- | --- |
-| 新的章节写作 Agent | `app/reporting/` | 实现 `ChapterWriter`，替换 Writer 装配 |
-| 数据分析/指标 Agent | `app/analysis/` 或独立业务包 | 通过 `DataCatalog` 和工具访问数据 |
-| 通用工具调用 Agent | `app/core/agent.py` 附近复用基础能力 | 由具体应用服务调用 |
-| 新的数据读取能力 | `app/tools/` + `app/data/sources/` | 先扩展数据源/工具，再被 Agent 调用 |
-
-### 6.1 新增章节 Writer Agent
-
-适用于：财务章节 Writer、风险章节 Writer、图表章节 Writer、不同模型供应商 Writer 等。
-
-步骤：
-
-1. 在 `app/reporting/` 新建文件，例如 `risk_chapter_writer.py`。
-2. 继承 `ChapterWriter`。
-3. 实现 `write(input, session) -> ChapterWriterResult`。
-4. 只通过 `ChapterWriterInput` 获取模板、数据源元信息、用户指令和历史回答。
-5. 成功时返回 `ChapterWriterResult(status="completed", draft=ChapterDraft(...))`。
-6. 需要用户补充时返回 `status="waiting_user"` 和 `UserQuestion`。
-7. 失败时返回 `status="failed"` 和可诊断的错误信息。
-8. 在 `app/dependencies.py` 中替换 `writer=` 的实现。
-9. 在 `backend/tests/` 增加单元测试和至少一个报告流程测试。
-
-示例骨架：
-
-```python
-from app.reporting.chapter_writer import ChapterWriter
-from app.core.reports import (
-    ChapterDraft,
-    ChapterWriterInput,
-    ChapterWriterResult,
-    ReportGenerationSession,
-)
-
-
-class RiskChapterWriter(ChapterWriter):
-    async def write(
-        self,
-        input: ChapterWriterInput,
-        session: ReportGenerationSession,
-    ) -> ChapterWriterResult:
-        # 通过 DataCatalog/ToolRegistry 读取数据，或调用 LlmService。
-        # 不要在这里直接改写 session 状态。
-        draft = ChapterDraft(
-            chapter_id=input.section.section_id,
-            section_id=input.section.section_id,
-            title=input.section.title,
-            content="...",
-        )
-        return ChapterWriterResult(status="completed", draft=draft)
-```
-
-如果新 Agent 只针对某些章节生效，不建议在 `ReportGenerationService` 中写大量标题判断。更推荐引入显式的 Writer 路由器，例如根据模板元数据、章节类型或配置选择 Writer，并让路由器本身实现 `ChapterWriter` 接口。
-
-### 6.2 新增数据分析 Agent
-
-适用于：指标计算、同比环比、异常检测、经营诊断等。
-
-推荐步骤：
-
-1. 在 `app/analysis/` 新建业务 Agent。
-2. 通过 `DataCatalog` 或 `ToolRegistry` 获取数据。
-3. 输入输出定义在 `app/core/models.py` 或新建领域模型文件中。
-4. 如果需要 LLM，依赖 `LlmService` 抽象，不直接实例化 OpenAI 客户端。
-5. 如果需要新动作，先在 `app/tools/` 增加工具。
-6. 由报告 Writer 或 API 应用服务显式调用。
-
-### 6.3 新增 Agent 工具
-
-例如增加 `calculate_metric`：
-
-1. 在 `app/tools/` 新建工具类，继承 `Tool`。
-2. 定义稳定的 `name`、`description` 和 `parameters_schema`。
-3. 在 `execute()` 中调用 `DataCatalog` 或领域服务。
-4. 对用户可控参数做校验和权限限制。
-5. 返回结构化 `ToolResult`，重要结论附带 `Evidence`。
-6. 在 `get_registry()` 注册。
-7. 如果只允许某个 Agent 使用，在 `ToolContext` 中增加权限判断，而不是在工具内部依赖调用方名称。
-
-章节 Writer 目前会过滤工具，只把 `read_dataset` 和 `query_dataset` 暴露给研究阶段。新增工具后，需要明确它是否应加入 `ChapterWriterAgent._read_tool_names` 或由新的 Agent 单独控制，不能默认让所有 Agent 使用。
-
-### 6.4 新增 LLM 实现
-
-如果要接入新的模型供应商：
-
-1. 实现 `core/ports.py` 中的 `LlmService`。
-2. 在 `infrastructure/` 新建适配器。
-3. 将供应商差异封装在适配器内，包括消息格式、工具调用格式、超时和错误转换。
-4. 在 `config.py` 增加配置项（如确有必要）。
-5. 在 `dependencies.py` 选择并装配实现。
-6. 使用假的 `LlmService` 编写确定性测试，避免单元测试依赖真实网络和 API Key。
-
-### 6.5 新增 Renderer 或持久化实现
-
-Renderer 应实现与 Markdown Renderer 相同的输出约定，并由 `ReportGenerationService` 统一调用。模板仓储、会话仓储和 ArtifactStore 则分别实现 `reporting/session.py` 和 `core/ports.py` 的接口，再在 `dependencies.py` 替换内存实现。
-
-## 7. 测试与本地运行
-
-在 `promptenv` 环境中：
+## 9. 测试与运行
 
 ```bash
-conda activate promptenv
-cd backend
-python -m pytest -q
+pip install -r requirements-dev.txt
+cp .env.example .env
 uvicorn app.main:app --reload --port 8000
+python -m pytest -q          # 当前 44 passed
 ```
 
-当前测试覆盖：
+测试分布：
 
-- 通用工具调用 Agent
-- 核心领域模型
-- Excel 读取、分页、筛选和 Profile
-- 报告模板解析
-- 报告外围流程和 Artifact
-- 章节 Writer Agent 的工具错误重试和章节写作
+| 文件 | 覆盖 |
+|---|---|
+| `test_conversation_orchestrator.py` | 意图路由、计划修订、确认生成、一会话一报告、缺数据提问 |
+| `test_conversation_api.py` | HTTP 层：multipart 上传、后台处理、旧写接口确已移除 |
+| `test_template_chapter_tree.py` | 章节归组、整章一次生成、缺数据阻塞与恢复、运行中可观测 |
+| `test_template_tables.py` | DOCX/Markdown 表格解析、提示词防回归 |
+| `test_report_generation.py` | 报告外围流程、重启对账 |
+| `test_chapter_writer_agent.py` | 取数重试、questions 优先于 status、无问题兜底 |
+| `test_excel_reading.py` / `test_core.py` / `test_agent.py` | 数据层与通用能力 |
 
-新增 Agent 至少应覆盖：
+> 不要同时起两个后端进程：它们共享同一个持久化文件，启动对账会把对方正在跑的会话判死。
 
-- 正常完成
-- 工具失败或参数错误
-- `waiting_user` 分支（如果 Agent 需要追问）
-- 结构化输出和证据传递
-- 与 `ReportGenerationService` 的集成
+## 10. 当前限制
 
-## 8. 当前架构限制与后续演进
+- **补数据闭环未完成**：问题卡只展示，不能输入；打字只能按顺序回答；`expected: dataset` 类问题没有提供数据的路径。
+- **无聚合工具**：Excel 数据源只有整行读取，指标计算依赖模型对原始行心算，行数一多必然出错。
+- **无 SSE**：前端 2s 轮询。
+- **后台任务是进程内 asyncio**：生成中途重启，该次运行不会自动恢复。
+- **模板与产物仍是内存存储**；DOCX/PDF/HTML 渲染未实现；DOCX 样式保真未实现。
+- **无认证与用户隔离**：`RequestContext` 固定为 `local-user`。
 
-当前已知限制：
-
-- `ReportPlan` 是扁平章节列表，尚未支持真正的多级章节树。
-- Planner 尚未生成具体数据任务、指标任务或章节依赖。
-- 报告只渲染 Markdown，尚未保真生成 DOCX/PDF/HTML。
-- 会话、模板、Artifact 都是内存存储。
-- 尚无真实认证、用户隔离、审计和异步任务调度。
-- 不支持跨数据源 JOIN。
-- `langgraph` 已列入依赖，但尚未进入当前业务执行链路。
-
-建议演进顺序：
-
-1. 完善模板层级模型和树形 `ReportPlan`。
-2. 抽取指标计算、聚合和图表规格工具。
-3. 增加 Writer 路由和章节级数据依赖。
-4. 增加真实的 DOCX/PDF/HTML Renderer。
-5. 将内存仓储替换为数据库和对象存储。
-6. 增加认证、权限、日志、监控和异步执行。
-7. 在稳定后再评估是否使用 LangGraph 管理复杂 Agent 状态图。
+演进顺序见 [../ROADMAP.md](../ROADMAP.md)。
