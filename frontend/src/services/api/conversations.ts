@@ -1,4 +1,4 @@
-import { apiClient } from './client'
+import { hostApi } from './client'
 import type {
   ApiResult,
   Conversation,
@@ -18,24 +18,24 @@ export interface PostMessageInput {
 
 export const conversationApi = {
   create(title?: string): Promise<ApiResult<Conversation>> {
-    return apiClient.post<Conversation>('/conversations', { title: title ?? null })
+    return hostApi.post<Conversation>('/conversations', { title: title ?? null })
   },
 
   list(): Promise<ApiResult<Conversation[]>> {
-    return apiClient.get<Conversation[]>('/conversations')
+    return hostApi.get<Conversation[]>('/conversations')
   },
 
   get(conversationId: string): Promise<ApiResult<ConversationDetail>> {
-    return apiClient.get<ConversationDetail>(`/conversations/${conversationId}`)
+    return hostApi.get<ConversationDetail>(`/conversations/${conversationId}`)
   },
 
   remove(conversationId: string): Promise<ApiResult<{ deleted: boolean }>> {
-    return apiClient.delete<{ deleted: boolean }>(`/conversations/${conversationId}`)
+    return hostApi.delete<{ deleted: boolean }>(`/conversations/${conversationId}`)
   },
 
   /** Stop the run in progress. Finished chapters are kept, so it can be resumed. */
   cancel(conversationId: string): Promise<ApiResult<ReportGenerationSession>> {
-    return apiClient.post<ReportGenerationSession>(`/conversations/${conversationId}/cancel`, {})
+    return hostApi.post<ReportGenerationSession>(`/conversations/${conversationId}/cancel`, {})
   },
 
   /** The only write path: text plus optional uploads, as one message. */
@@ -45,6 +45,6 @@ export const conversationApi = {
     if (input.templateFile) form.append('template_file', input.templateFile)
     if (input.dataFile) form.append('data_file', input.dataFile)
     if (input.resolutions?.length) form.append('resolutions', JSON.stringify(input.resolutions))
-    return apiClient.uploadForm<Message>(`/conversations/${conversationId}/messages`, form)
+    return hostApi.uploadForm<Message>(`/conversations/${conversationId}/messages`, form)
   },
 }

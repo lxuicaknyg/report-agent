@@ -1,0 +1,78 @@
+# AI 数据分析工作台 —— 离线内网部署。
+#
+# 两个容器：gateway（前端 SPA + nginx 反代）和 backend（报告生成后端）。
+# 其他团队的后端加到同一个网络里，用服务名互访，路由配在
+# deploy/nginx-modules/ 下。
+#
+# 配置走 .env（从 deploy/env.example 复制），见 DEPLOY.md。
+
+name: report-agent
+
+services:
+  gateway:
+    image: report-agent-gateway:${IMAGE_TAG:-latest}
+    build:
+      context: ./frontend
+    ports:
+      # 只有这一个对外端口。后端不映射端口 —— 它只应该被网关访问到，
+      # 直接暴露等于绕过了 nginx 的上传限制和超时设置。
+      - "${GATEWAY_PORT:-80}:80"
+    volumes:
+      - ./deploy/nginx-modules:/etc/nginx/workspace-modules:ro
+    depends_on:
+      backend:
+        condition: service_healthy
+    networks: [workspace]
+    restart: unless-stopped
+
+  backend:
+    image: report-agent-backend:${IMAGE_TAG:-latest}
+    build:
+      context: ./backend
+    environment:
+      ENVIRONMENT: production
+
+      # 工作台内所有后端必须共用这一个值，否则同事的后端验不了宿主签发的
+      # token，用户会在他们的工具里被反复要求重新登录。没配后端会拒绝启动。
+      AUTH_SECRET: ${AUTH_SECRET:?AUTH_SECRET 必须设置，且与其他团队后端一致}
+      AUTH_DATABASE_URL: ${AUTH_DATABASE_URL:?未配置用户库，没人能登录}
+      AUTH_TOKEN_TTL_SECONDS: ${AUTH_TOKEN_TTL_SECONDS:-43200}
+
+      # 内网的 OpenAI 兼容网关。
+      LLM_BASE_URL: ${LLM_BASE_URL:?未配置 LLM 网关地址}
+      LLM_API_KEY: ${LLM_API_KEY:-}
+      LLM_MODEL_NAME: ${LLM_MODEL_NAME:?未配置模型名}
+      LLM_TIMEOUT_SECONDS: ${LLM_TIMEOUT_SECONDS:-60}
+      LLM_MAX_ATTEMPTS: ${LLM_MAX_ATTEMPTS:-5}
+
+      # openLooKeng：JRE 已在镜像里，这里只指驱动 jar 的挂载点。
+      # 服务会在该目录下自动找 jar，部署不必对齐文件名。
+      JDBC_JAR_DIR: /opt/jdbc
+      # 服务端报 "Authentication requires SSL" 时设为 true。
+      HETU_JDBC_SSL: ${HETU_JDBC_SSL:-false}
+
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    volumes:
+      # 需要留存的东西全在 STATE_DIR 下：上传的文件、生成的报告、报告与会话
+      # 状态、模板、已保存的数据源连接。一个卷就够。
+      - report-state:/var/lib/report-agent
+
+      # openLooKeng 的 JDBC 驱动 jar。JRE 已经装在镜像里了，这里只挂 jar ——
+      # jar 是厂商授权的、还要和集群版本对上，不适合固化进镜像层。
+      # 用不到 openLooKeng 的话这行删掉即可，只有那一个驱动会失效。
+      - ${JDBC_JAR_DIR_HOST:-./deploy/jdbc}:/opt/jdbc:ro
+    networks: [workspace]
+    restart: unless-stopped
+    # 单副本、单 worker，不是保守，是必须的：报告生成跑在进程内的 asyncio
+    # 任务里，进度存在内存 + 卷上的 JSON。加副本会让轮询打到没有该任务的进程
+    # （用户看到 404），并且两个进程并发写同一份 JSON。详见 DEPLOY.md。
+    deploy:
+      replicas: 1
+
+volumes:
+  report-state:
+
+networks:
+  workspace:
+    # 同事的后端加到这个网络里，就能用服务名互相访问。
+    name: report-agent-workspace

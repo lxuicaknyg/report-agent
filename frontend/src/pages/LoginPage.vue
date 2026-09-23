@@ -7,32 +7,37 @@ const router = useRouter()
 const route = useRoute()
 const authStore = useAuthStore()
 
-const username = ref('admin')
-const password = ref('admin')
+const FEATURES = [
+  '数据分析报告撰写',
+  'AI + 数据分析',
+  '自动化数据处理',
+  '报告解读',
+  '全程数据溯源',
+]
+
+const username = ref('')
+const password = ref('')
 const errorMessage = ref('')
 const isSubmitting = ref(false)
 const showPassword = ref(false)
 
 async function handleLogin() {
   if (!username.value.trim() || !password.value) {
-    errorMessage.value = '请输入管理员账号和密码。'
+    errorMessage.value = '请输入账号和密码。'
     return
   }
   isSubmitting.value = true
   errorMessage.value = ''
   try {
-    const ok = await authStore.login(username.value.trim(), password.value)
-    if (ok) {
-      const redirect = typeof route.query.redirect === 'string' ? route.query.redirect : '/conversations/new'
-      await router.push(redirect)
-      return
-    }
-    errorMessage.value = '账号或密码不正确，请重新输入。'
+    await authStore.login(username.value.trim(), password.value)
+    const redirect = typeof route.query.redirect === 'string' ? route.query.redirect : '/conversations/new'
+    await router.push(redirect)
   } catch (e) {
-    errorMessage.value = `登录失败：${String(e)}`
+    // 后端已经给出了可读的原因（密码错 / 数据库连不上），直接用，别再包一层。
+    errorMessage.value = e instanceof Error ? e.message : '登录失败，请重试。'
+    password.value = ''
   } finally {
     isSubmitting.value = false
-    password.value = ''
   }
 }
 </script>
@@ -49,8 +54,25 @@ async function handleLogin() {
       </div>
 
       <div class="brand-message">
-        <h1>让数据分析师专注分析，而非报告撰写。</h1>
-        <p>从数据梳理到报告成文，AI 陪伴分析师规划、查询与写作，全面提升数据分析效率。</p>
+        <div
+          class="brand-features"
+          :style="{ '--rows': FEATURES.length, '--cycle': `${FEATURES.length * 4}s` }"
+        >
+          <div class="brand-features-track">
+            <!-- 两份完全相同的列表首尾相接，位移一半即无缝循环 -->
+            <div v-for="feature in FEATURES" :key="feature" class="feature-row">
+              {{ feature }}
+            </div>
+            <div
+              v-for="feature in FEATURES"
+              :key="`loop-${feature}`"
+              class="feature-row"
+              aria-hidden="true"
+            >
+              {{ feature }}
+            </div>
+          </div>
+        </div>
       </div>
 
       <div class="brand-footer">
@@ -74,7 +96,7 @@ async function handleLogin() {
             v-model="username"
             type="text"
             autocomplete="username"
-            placeholder="请输入管理员账号"
+            placeholder="请输入账号"
             class="form-input"
             @keyup.enter="handleLogin"
           />
@@ -148,8 +170,61 @@ async function handleLogin() {
 .brand-lockup span { color: #6f6285; font-size: 11px; }
 
 .brand-message { max-width: 580px; padding: 80px 0; }
-.brand-message h1 { max-width: 530px; margin: 13px 0 16px; color: #102a43; font-size: 44px; line-height: 1.18; letter-spacing: 0; }
-.brand-message p { max-width: 470px; margin: 0; color: #5f4d77; font-size: 14px; line-height: 1.7; }
+/* 只露出一组的高度，多出来的那份复制藏在下方等着转上来 */
+.brand-features {
+  --row-h: 44px;
+  max-width: 470px;
+  /* 文字居中后，整块也居中；再保留之前那个 56px 右移会两边不对称 */
+  margin: 0 auto;
+  height: calc(var(--row-h) * var(--rows, 3));
+  overflow: hidden;
+  /* 上下淡出，滚动时不会在边缘被生硬切断 */
+  mask-image: linear-gradient(180deg, transparent, #000 12%, #000 88%, transparent);
+  -webkit-mask-image: linear-gradient(180deg, transparent, #000 12%, #000 88%, transparent);
+}
+
+.brand-features-track {
+  animation: features-scroll var(--cycle, 12s) linear infinite;
+}
+
+/* 想看清某一条时停一下 */
+.brand-features:hover .brand-features-track {
+  animation-play-state: paused;
+}
+
+.feature-row {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  /* 行高写死，两份复制才会等高，位移 -50% 才能严丝合缝 */
+  height: var(--row-h);
+  color: #3a2a55;
+  font-size: 16px;
+  font-weight: 600;
+  letter-spacing: 0.2px;
+}
+
+@keyframes features-scroll {
+  to { transform: translateY(-50%); }
+}
+
+/* 关掉动效时不滚动，直接摊开全部条目 */
+@media (prefers-reduced-motion: reduce) {
+  .brand-features {
+    height: auto;
+    mask-image: none;
+    -webkit-mask-image: none;
+  }
+
+  .brand-features-track {
+    animation: none !important;
+    transform: none !important;
+  }
+
+  .feature-row[aria-hidden='true'] {
+    display: none;
+  }
+}
 
 .login-form-panel { display: flex; align-items: center; justify-content: center; min-height: 100vh; padding: 40px; }
 .login-form { width: min(440px, 100%); padding: 40px 38px; border: 1px solid #d9e2ec; border-radius: 8px; background: #fff; box-shadow: 0 12px 34px rgba(16, 42, 67, 0.08); }
@@ -178,7 +253,6 @@ async function handleLogin() {
   .login-page { grid-template-columns: 1fr; }
   .login-brand-panel { min-height: 250px; padding: 28px; }
   .brand-message { padding: 44px 0 20px; }
-  .brand-message h1 { font-size: 30px; }
   .brand-footer { display: none; }
   .login-form-panel { min-height: auto; padding: 28px 18px 42px; }
   .login-form { padding: 28px 24px; }

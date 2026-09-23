@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, ref } from 'vue'
-import type { Message, ProgressChapter, ProgressMessagePayload } from '../../../types'
+import type { ChapterDraft, Message, ProgressChapter, ProgressMessagePayload } from '../../../types'
+import ProvenancePanel from './ProvenancePanel.vue'
 import { renderMarkdown } from '../../../utils/markdown'
 
 const props = defineProps<{
@@ -9,6 +10,8 @@ const props = defineProps<{
   live?: ProgressChapter[] | null
   /** Session status, so the flow can close itself off once the report is done. */
   sessionStatus?: string | null
+  /** Finished chapters, keyed by section, for the per-chapter provenance panel. */
+  drafts?: Record<string, ChapterDraft> | null
 }>()
 
 const payload = computed(() => props.message.payload as unknown as ProgressMessagePayload)
@@ -18,7 +21,14 @@ const STATE_TEXT: Record<string, string> = {
   completed: '已完成',
   running: '正在生成中',
   waiting_user: '等待补充数据',
+  // 跑被停掉/失败时停在这一章：说「继续」会从这里接着写
+  stopped: '已在此处停下',
   pending: '等待生成',
+}
+
+/** The stored draft behind a flow step, if the chapter has finished. */
+function draftFor(chapter: ProgressChapter): ChapterDraft | undefined {
+  return props.drafts?.[chapter.section_id]
 }
 
 function stateOf(chapter: ProgressChapter): string {
@@ -83,6 +93,7 @@ function isOpen(chapter: ProgressChapter): boolean {
           stroke-width="3.4" stroke-linecap="round" stroke-linejoin="round"
         ><polyline points="20 6 9 17 4 12" /></svg>
         <span v-else-if="stateOf(chapter) === 'waiting_user'" class="flow-mark-glyph">!</span>
+        <span v-else-if="stateOf(chapter) === 'stopped'" class="flow-mark-glyph">‖</span>
         <span v-else-if="stateOf(chapter) === 'running'" class="flow-mark-pulse" />
       </span>
 
@@ -116,6 +127,9 @@ function isOpen(chapter: ProgressChapter): boolean {
           class="flow-content md-content"
           v-html="renderMarkdown(chapter.content)"
         />
+        <div v-if="isOpen(chapter) && draftFor(chapter)" class="flow-prov">
+          <ProvenancePanel :chapters="[draftFor(chapter)!]" />
+        </div>
       </div>
     </div>
 
@@ -239,6 +253,13 @@ function isOpen(chapter: ProgressChapter): boolean {
   color: var(--color-warning);
 }
 
+/* 停在这一章：中性灰，既不是出错也不是待办，只是没在跑 */
+.flow-mark.stopped {
+  background: var(--color-bg-gray);
+  border-color: transparent;
+  color: var(--color-text-light);
+}
+
 .flow-mark-glyph {
   font-size: 11px;
   font-weight: 800;
@@ -307,6 +328,7 @@ function isOpen(chapter: ProgressChapter): boolean {
 .flow-state.completed { color: var(--color-success); }
 .flow-state.running { color: var(--color-primary); }
 .flow-state.waiting_user { color: var(--color-warning); }
+.flow-state.stopped { color: var(--color-text-light); }
 
 .flow-chevron {
   margin-left: auto;
@@ -320,6 +342,8 @@ function isOpen(chapter: ProgressChapter): boolean {
 }
 
 /* 正文直接落在对话流里，不再套一层卡片背景 */
+.flow-prov { padding: 0 0 6px 2px; }
+
 .flow-content {
   margin-top: 6px;
   font-size: 13.5px;

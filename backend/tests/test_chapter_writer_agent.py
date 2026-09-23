@@ -4,6 +4,7 @@ import json
 from app.core.models import DataReadResult, Evidence
 from app.core.ports import LlmService
 from app.core.reports import (
+    ChapterSupplement,
     ChapterWriterInput,
     DataSourceMetadata,
     ReportGenerationSession,
@@ -182,6 +183,14 @@ def test_each_unresolved_metric_becomes_its_own_question():
             ChapterWriterInput(
                 section=ReportTemplateSection(section_id="section_1", title="经营概况", order=0),
                 metrics=["同比增速", "分行明细"],
+                # This is about what research does with a metric it cannot
+                # settle, so it needs something to have searched.
+                data_sources=[
+                    DataSourceMetadata(
+                        dataset_id="sales", name="销售 Excel", source_type="excel",
+                        sheets=[{"sheet_name": "交易明细"}],
+                    )
+                ],
             ),
             ReportGenerationSession(
                 session_id="session-1",
@@ -375,6 +384,16 @@ def test_parking_without_questions_still_names_what_is_missing():
     asyncio.run(run())
 
 
+def chapter_input(**overrides) -> ChapterWriterInput:
+    """A minimal chapter, for the helpers that classify against one."""
+    return ChapterWriterInput(
+        section=ReportTemplateSection(section_id="section_1", title="交易分析", order=0),
+        metrics=["累计交易客户数"],
+        report_outline=["交易分析"],
+        **overrides,
+    )
+
+
 def test_a_question_without_an_id_does_not_fail_the_report():
     """The model is not asked to invent ids; a missing one must not crash the run."""
     questions = ChapterWriterAgent._questions(
@@ -382,7 +401,8 @@ def test_a_question_without_an_id_does_not_fail_the_report():
             {"metric": "累计交易客户数", "content": "需要按客户去重的口径"},
             {"metric": "没有正文的问题"},
             "不是对象",
-        ]
+        ],
+        chapter_input(),
     )
     assert len(questions) == 1
     assert questions[0].metric == "累计交易客户数"
@@ -477,3 +497,115 @@ def test_a_metric_worked_out_in_prose_is_asked_for_again_until_the_budget_runs_o
         assert findings[0]["value"] == "209,336,720 元"
 
     asyncio.run(run())
+
+
+def test_a_metric_the_user_supplied_is_not_researched_again():
+    """The user already gave the number, and the data it could not be found in
+    has not changed. Looking again only rediscovers that it is missing, which
+    comes back as the very question they just answered."""
+
+    async def run():
+        llm = ScriptedLlm(
+            # One turn only: composition. No research turn is scripted, so any
+            # attempt to research a metric would pop the composition reply and
+            # break the test loudly.
+            [{"content": '{"status":"completed","content":"不良贷款余额 1.24 亿元。"}', "tool_calls": []}]
+        )
+        registry = ToolRegistry()
+        registry.register(FakeReadDatasetTool())
+        agent = ChapterWriterAgent(llm=llm, tools=registry)
+        section = ReportTemplateSection(
+            section_id="section_10",
+            title="四、资产质量",
+            order=0,
+            template_text="四、资产质量\n\n本章说明资产质量。",
+            template_blocks=[{"type": "heading", "text": "四、资产质量"}],
+        )
+        result = await agent.write(
+            ChapterWriterInput(
+                section=section,
+                metrics=["不良贷款余额"],
+                report_outline=["四、资产质量"],
+                data_sources=[
+                    DataSourceMetadata(
+                        dataset_id="sales",
+                        name="销售 Excel",
+                        source_type="excel",
+                        sheets=[{"sheet_name": "交易明细"}],
+                    )
+                ],
+                supplements=[ChapterSupplement(metric="不良贷款余额", value="1.24 亿元")],
+            ),
+            ReportGenerationSession(
+                session_id="session-1",
+                user_id="user-1",
+                template_id="template-1",
+                dataset_ids=["sales"],
+                instruction="生成",
+                status=ReportGenerationStatus.RUNNING,
+            ),
+        )
+
+        assert result.status == "completed"
+        # Exactly one model call, and it is the composition one.
+        assert len(llm.calls) == 1
+        messages, tools = llm.calls[0]
+        assert tools == []
+        request = json.loads(messages[-1]["content"])
+        assert request["supplements"] == [
+                {"metric": "不良贷款余额", "source": "manual", "value": "1.24 亿元"}
+            ]
+
+    asyncio.run(run())
+
+
+def test_a_sql_supplement_carries_its_query_into_the_finding():
+    """The provenance panel reads the statement off the finding, so a value
+    fetched by SQL has to arrive there with the SQL attached."""
+    from app.core.reports import ChapterSupplement
+    from app.reporting.chapter_writer_agent import ChapterWriterAgent
+
+    findings = ChapterWriterAgent._supplement_findings(
+        ChapterWriterInput(
+            section=ReportTemplateSection(section_id="s1", title="一、存款", level=1, order=0),
+            supplements=[
+                ChapterSupplement(
+                    metric="4月末存款余额",
+                    value="2049900.25",
+                    dimensions={"统计日期": "2024-04-15"},
+                    source="sql",
+                    connection_id="conn_1",
+                    connection_name="本地 MySQL",
+                    query="SELECT ...",
+                )
+            ],
+        )
+    )
+    assert findings[0].value == "2049900.25"
+    assert findings[0].basis == "用户 SQL 取数（统计日期=2024-04-15）"
+    assert findings[0].reads == [
+        {
+            "kind": "sql",
+            "connection_id": "conn_1",
+            "connection_name": "本地 MySQL",
+            "sql": "SELECT ...",
+            "dimensions": {"统计日期": "2024-04-15"},
+            "columns": [],
+            "rows": [],
+            "rows_truncated": False,
+        }
+    ]
+
+
+def test_a_typed_in_supplement_stays_labelled_as_typed_in():
+    from app.core.reports import ChapterSupplement
+    from app.reporting.chapter_writer_agent import ChapterWriterAgent
+
+    findings = ChapterWriterAgent._supplement_findings(
+        ChapterWriterInput(
+            section=ReportTemplateSection(section_id="s1", title="一、存款", level=1, order=0),
+            supplements=[ChapterSupplement(metric="不良率", value="1.08%", note="含贴现")],
+        )
+    )
+    assert findings[0].basis == "用户补充（含贴现）"
+    assert findings[0].reads == []

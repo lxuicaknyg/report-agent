@@ -84,20 +84,31 @@ backend/app/
 │
 ├── api/routes/
 │   ├── health.py
+│   ├── auth.py                        登录、/me、current_user 依赖
 │   ├── conversations.py               唯一写入口所在
 │   ├── reports.py                     只读
-│   ├── datasets.py
-│   └── analysis.py
+│   ├── connections.py                 数据源连接 CRUD / 测试 / 取数
+│   └── datasets.py
+│
+├── auth/                              ★ 登录
+│   ├── service.py                     校验口令、签发与解析 token
+│   └── repository.py                  读 AI_DA_DB.users
 │
 ├── conversations/                     ★ 对话层
 │   ├── orchestrator.py                意图路由与消息产出
 │   └── repository.py                  ConversationRepository 抽象
 │
+├── connections/                       ★ 已保存的数据库连接
+│   ├── service.py                     连通性测试与只读取数
+│   └── repository.py                  ConnectionRepository 抽象 + 文件持久化
+│
 ├── core/                              领域模型与端口，无 IO
 │   ├── conversations.py               Conversation / Message / MessageIntent
 │   ├── reports.py                     报告全部模型 + group_template_chapters
+│   ├── connections.py                 DataConnection / 取数请求与指标抽取
+│   ├── auth.py                        AuthUser / LoginRequest / 鉴权异常
 │   ├── models.py                      通用模型、Evidence、RequestContext
-│   ├── ports.py                       DataSource / LlmService / ArtifactStore / UserResolver
+│   ├── ports.py                       LlmService / ArtifactStore
 │   ├── tooling.py                     Tool / ToolContext / ToolResult / ToolRegistry
 │   └── agent.py                       通用工具调用循环（底层可复用能力）
 │
@@ -109,27 +120,26 @@ backend/app/
 │   ├── chapter_writer_agent.py        两阶段章节 Agent
 │   ├── assembler.py                   ChapterDraft → AssembledReport
 │   ├── renderer.py                    AssembledReport → Markdown
-│   ├── session.py                     报告与模板仓储接口
-│   └── reports.py                     旧版 ReportService（当前无调用方）
+│   └── session.py                     报告与模板仓储接口
 │
 ├── data/
 │   ├── catalog.py                     dataset_id → RegisteredDataSource
 │   └── sources/{base,excel,sql}.py
 │
-├── tools/dataset_tools.py             只读数据工具
-│
-├── analysis/agent.py                  AnalysisAgent（确定性分析链路）
+├── tools/
+│   ├── dataset_tools.py               只读数据工具
+│   └── sql2sql_tool.py                自然语言 → 分析 SQL
 │
 └── infrastructure/
     ├── llm.py                         OpenAI-compatible 适配 + 调用日志
     ├── logging.py                     文件 + 控制台日志，preview() 截断
     ├── conversation_repositories.py   会话/消息：内存 + 文件持久化
-    ├── report_repositories.py         报告会话：内存 + 文件持久化；模板：内存
-    ├── artifact_store.py              内存产物存储
-    └── users.py                       LocalUserResolver
+    ├── report_repositories.py         报告会话：内存 + 文件持久化；模板：仅内存
+    └── artifact_store.py              产物：内存 + 文件系统（默认文件系统）
 ```
 
-> `app/analysis/` 下除 `agent.py` 外还残留 8 个与 `app/reporting/` 重复的模块（assembler、planner、renderer 等），是目录重构未收尾的产物，**当前无任何引用**。见 ROADMAP 的清理项。
+> 模板仓储是唯一没有持久化实现的：进程重启后 `GET /reports/templates/{id}` 返回 404，
+> 而解析后的结构已随会话存入 `sessions.json`，所以报告生成本身不受影响。
 
 ## 4. 对话层
 
@@ -241,6 +251,22 @@ created → awaiting_confirmation ⇄ (revise_plan)
 - `chapter_plan.metrics` 为空的叙述性章节（前言、数据来源说明）不允许因缺数据提问。
 - 表格必须写在 `content` 里。`ChapterDraft.tables` 字段渲染器不消费，模型把表放进去就等于丢弃。
 
+### 6.1 追问：先判定要什么，再问怎么补
+
+一条 `UserQuestion` 带 `expected`，它在**提问时**就已经定下，用户不需要自己声明答案的形态：
+
+| `expected` | 含义 | 用户可用的补充方式 |
+| --- | --- | --- |
+| `value` | 正文里引用的一个数 | 直接填数值 / 写 SQL |
+| `table` | 要填进模板表格、或本身就是逐行清单的一份明细 | 粘贴明细 / 写 SQL |
+| `text` | 一段文字说明 | 直接填写 |
+
+判定顺序：取数 agent 在 unresolved 里给的 `needs` 优先（它刚为这个指标取过数，最清楚）；没给就看本章模板表头是否出现过该指标名、以及指标名本身像不像一份清单（`_expectation`）。
+
+`expected` 决定后端怎么读用户的 SQL：`value` 走「最后一列是取值、前面列是维度，且必须收敛到一行」，`table` 走「所有列都是内容，最多 100 行」。这条守卫是有意保留的——一个本该是单值的指标返回了 50 行，必须报错而不是静默取第一行。判定错了由用户一键纠正（`QuestionResolutionInput.as_table`），而不是让所有人每次都先选一次。
+
+粘贴的明细由 `core/tabular.py` 解析，支持 Excel 复制（制表符）、`指标：数值` 多指标行、Markdown 表格、逗号分隔与空格对齐。解析只有服务端一份实现：`POST /supplements/preview` 给用户看的预览，和提交后真正入库的那次解析，走的是同一个函数。
+
 ## 7. 实际运行流程
 
 ```text
@@ -321,7 +347,7 @@ python -m pytest -q          # 当前 44 passed
 
 ## 10. 当前限制
 
-- **补数据闭环未完成**：问题卡只展示，不能输入；打字只能按顺序回答；`expected: dataset` 类问题没有提供数据的路径。
+- **追问不支持上传文件**：明细可以粘贴或写 SQL 取，但不能直接传一个 Excel 上来。
 - **无聚合工具**：Excel 数据源只有整行读取，指标计算依赖模型对原始行心算，行数一多必然出错。
 - **无 SSE**：前端 2s 轮询。
 - **后台任务是进程内 asyncio**：生成中途重启，该次运行不会自动恢复。

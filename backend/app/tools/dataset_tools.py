@@ -205,9 +205,24 @@ class AggregateDatasetTool(Tool):
                 value=result.model_dump(),
                 method=request.model_dump_json(exclude_defaults=True),
             )
+            # Whatever qualifies the figures travels with them. A caller that
+            # is told "100 groups" and not "of 438" reports a tenth of the
+            # bank as the bank, and a column silently read as text is how a
+            # sum comes back as a concatenation.
+            notes: list[str] = []
+            if result.groups_truncated:
+                notes.append(
+                    f"WARNING: only the first {result.row_count} of {result.total_groups} groups "
+                    f"are shown (limit={request.limit}) — this is not the full breakdown"
+                )
+            if result.source_rows_truncated:
+                notes.append("note: source line numbers are capped per group")
+            notes.extend(result.warnings)
             summary = (
                 f"Aggregated {result.matched_rows} matching rows into {result.row_count} groups"
             )
+            if notes:
+                summary = "\n".join([summary, *notes])
             return ToolResult(success=True, result_for_llm=summary, data=result, evidence=[evidence])
         except Exception as exc:
             return ToolResult(success=False, result_for_llm=str(exc), error=str(exc))

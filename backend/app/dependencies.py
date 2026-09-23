@@ -2,21 +2,21 @@ from __future__ import annotations
 
 import logging
 import re
-import tempfile
+import secrets
 from functools import lru_cache
-from pathlib import Path
 
+from .auth import AuthService, UserRepository
 from .conversations import ConversationOrchestrator
 from .connections import ConnectionService, PersistentConnectionRepository
 from .core.tooling import ToolRegistry
 from .data.catalog import DataCatalog
 from .data.sources.excel import ExcelDataSource
-from .infrastructure.artifact_store import InMemoryArtifactStore
+from .infrastructure.artifact_store import FileSystemArtifactStore
 from .infrastructure.conversation_repositories import PersistentConversationRepository
 from .infrastructure.llm import OpenAICompatibleLlmService
 from .infrastructure.report_repositories import (
     PersistentReportSessionRepository,
-    InMemoryReportTemplateRepository,
+    PersistentReportTemplateRepository,
 )
 from .reporting import (
     MarkdownReportRenderer,
@@ -24,7 +24,6 @@ from .reporting import (
     ReportGenerationService,
     ChapterWriterAgent,
     ReportPlanner,
-    ReportService,
     ReportTemplateParser,
     StubChapterWriter,
 )
@@ -33,11 +32,39 @@ from .config import settings
 logger = logging.getLogger(__name__)
 from .tools import (
     AggregateDatasetTool,
+    GenerateAnalysisSQLTool,
     ListDatasetsTool,
     ListSheetsTool,
     ProfileDatasetTool,
     ReadDatasetTool,
 )
+
+
+@lru_cache
+def get_auth_service() -> AuthService:
+    secret = settings.auth_secret
+    if not secret:
+        if settings.environment != "development":
+            # A random secret is survivable alone, but this service shares its
+            # tokens with other teams' backends: a secret nobody else can know
+            # means every one of their requests 401s, and the symptom shows up
+            # in their logs rather than ours. Refusing to start is the only way
+            # that failure gets diagnosed in seconds instead of an afternoon.
+            raise RuntimeError(
+                "AUTH_SECRET 未设置。工作台内所有后端必须共用同一个密钥才能互相验签，"
+                "请在部署环境里下发 AUTH_SECRET 后再启动。"
+            )
+        # Better a secret that dies with the process than one committed to the
+        # repo: unset AUTH_SECRET only costs everyone a re-login on restart.
+        secret = secrets.token_urlsafe(48)
+        logger.warning(
+            "AUTH_SECRET 未设置，本次启动使用随机密钥；重启后已签发的 token 全部失效。"
+        )
+    return AuthService(
+        UserRepository(settings.auth_database_url),
+        secret=secret,
+        token_ttl_seconds=settings.auth_token_ttl_seconds,
+    )
 
 
 @lru_cache
@@ -85,8 +112,9 @@ def get_connection_service() -> ConnectionService:
     # credentials, and ./data is watched by uvicorn --reload.
     return ConnectionService(
         PersistentConnectionRepository(
-            Path(tempfile.gettempdir()) / "report-agent-connections.json"
-        )
+            settings.connection_store
+        ),
+        analysis_tool=GenerateAnalysisSQLTool(llm=get_llm()),
     )
 
 
@@ -103,22 +131,20 @@ def get_llm() -> OpenAICompatibleLlmService:
 
 
 @lru_cache
-def get_report_service() -> ReportService:
-    return ReportService()
-
-
-@lru_cache
 def get_report_generation_service() -> ReportGenerationService:
     return ReportGenerationService(
-        sessions=PersistentReportSessionRepository(Path(tempfile.gettempdir()) / "report-agent-sessions.json"),
-        templates=InMemoryReportTemplateRepository(),
+        sessions=PersistentReportSessionRepository(settings.session_store),
+        templates=PersistentReportTemplateRepository(
+            settings.template_store, settings.template_content_dir
+        ),
         template_parser=ReportTemplateParser(),
         planner=ReportPlanner(llm=get_llm()),
         writer=ChapterWriterAgent(llm=get_llm(), tools=get_registry()),
         assembler=ReportAssembler(),
         renderer=MarkdownReportRenderer(),
-        artifact_store=InMemoryArtifactStore(),
+        artifact_store=FileSystemArtifactStore(settings.artifact_dir),
         catalog=get_catalog(),
+        connections=get_connection_service(),
     )
 
 
@@ -126,7 +152,7 @@ def get_report_generation_service() -> ReportGenerationService:
 def get_conversation_orchestrator() -> ConversationOrchestrator:
     return ConversationOrchestrator(
         conversations=PersistentConversationRepository(
-            Path(tempfile.gettempdir()) / "report-agent-conversations.json"
+            settings.conversation_store
         ),
         reports=get_report_generation_service(),
         llm=get_llm(),

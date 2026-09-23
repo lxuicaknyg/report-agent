@@ -44,6 +44,11 @@ def _normalize_headers(values: Iterable[Any]) -> list[str]:
     return headers
 
 
+#: Internal column carrying each result row's worksheet lines through the
+#: aggregation. Stripped before anything leaves this module.
+_LINES = "__source_lines__"
+
+
 class ExcelDataSource(RegisteredDataSource):
     """Excel 读取型数据源。
 
@@ -237,31 +242,65 @@ class ExcelDataSource(RegisteredDataSource):
             frame = frame[_filter_mask(frame, item)]
         matched = len(frame)
 
+        # Numbers stored as text are the norm in exported workbooks, and pandas
+        # sums an object column by concatenating it: '1200.5' + '300' comes
+        # back as '1200.5300', with no error anywhere. Convert before
+        # aggregating and say so, rather than letting a string that looks like
+        # a total reach the report.
+        warnings: list[str] = []
+        frame = _numeric_frame(frame, request.metrics, warnings)
+        # Filtering preserves the original index, so every surviving row still
+        # knows which worksheet line it came from. That is the whole of
+        # row-level provenance: carry it through the aggregation as another
+        # column so sorting and limiting keep it aligned with its figures,
+        # instead of reconstructing the pairing afterwards.
+        lines = frame.index.map(self._excel_line)
+
         if request.metrics:
             named = {
                 (item.alias or f"{item.function}_{item.column}"): item
                 for item in request.metrics
             }
             if request.group_by:
-                grouped = frame.groupby(request.group_by, dropna=False)
-                result = pd.DataFrame(
-                    {alias: _apply(grouped[item.column], item.function) for alias, item in named.items()}
-                ).reset_index()
+                grouped = frame.assign(**{_LINES: lines}).groupby(request.group_by, dropna=False)
+                aggregated = {
+                    alias: _apply(grouped[item.column], item.function)
+                    for alias, item in named.items()
+                }
+                aggregated[_LINES] = grouped[_LINES].apply(list)
+                result = pd.DataFrame(aggregated).reset_index()
             else:
                 result = pd.DataFrame(
-                    [{alias: _apply(frame[item.column], item.function) for alias, item in named.items()}]
+                    [{
+                        **{alias: _apply(frame[item.column], item.function) for alias, item in named.items()},
+                        _LINES: list(lines),
+                    }]
                 )
         else:
             # No metric asked for: the caller wants the distinct combinations,
             # which is how a dimension's values get enumerated.
-            result = frame[request.group_by].drop_duplicates().reset_index(drop=True)
+            result = frame[request.group_by].drop_duplicates()
+            result = result.assign(**{_LINES: [[self._excel_line(i)] for i in result.index]})
+            result = result.reset_index(drop=True)
 
         order_by = request.order_by
         if order_by:
-            if order_by not in result.columns:
-                raise ValueError(f"Unknown order_by column: {order_by}. Available: {list(result.columns)}")
+            if order_by == _LINES or order_by not in result.columns:
+                available = [name for name in result.columns if name != _LINES]
+                raise ValueError(f"Unknown order_by column: {order_by}. Available: {available}")
             result = result.sort_values(order_by, ascending=not request.descending)
+        total_groups = len(result)
         result = result.head(request.limit)
+        if total_groups > len(result):
+            warnings.append(
+                f"分组数 {total_groups} 超过 limit={request.limit}，只返回了前 {len(result)} 组，"
+                "这不是全部分项；需要完整分项请调大 limit 或收窄 filters"
+            )
+        source_rows = [list(item)[: self._MAX_SOURCE_ROWS] for item in result[_LINES]]
+        truncated = any(
+            len(capped) < len(full) for capped, full in zip(source_rows, result[_LINES])
+        )
+        result = result.drop(columns=[_LINES])
 
         rows = result.where(pd.notna(result), None).to_dict("records")
         return AggregateResult(
@@ -271,7 +310,25 @@ class ExcelDataSource(RegisteredDataSource):
             rows=[{str(key): _plain(value) for key, value in row.items()} for row in rows],
             row_count=len(rows),
             matched_rows=matched,
+            source_rows=source_rows,
+            source_rows_truncated=truncated,
+            source_columns=sorted(
+                {item.column for item in request.metrics}
+                | {item.column for item in request.filters}
+            ),
+            total_groups=total_groups,
+            groups_truncated=total_groups > len(result),
+            warnings=warnings,
         )
+
+    #: Per result row. A figure checked by hand needs a handful of lines to look
+    #: at, not every line that went into a six-month total.
+    _MAX_SOURCE_ROWS = 200
+
+    @staticmethod
+    def _excel_line(index: Any) -> int:
+        # 0-based frame index, one header row above the data.
+        return int(index) + 2
 
     async def query(self, dataset_id: str, sql: str, limit: int = 500) -> QueryResult:
         self._check_dataset(dataset_id)
@@ -395,6 +452,74 @@ def _plain(value: Any) -> Any:
     if hasattr(value, "item"):  # numpy scalar
         return value.item()
     return value
+
+
+#: Aggregations that are arithmetic and so need real numbers. ``min``/``max``
+#: are left alone on purpose: the earliest date and the first branch name
+#: alphabetically are both legitimate answers, and coercing those columns would
+#: turn a working call into an error.
+_ARITHMETIC = {"sum", "avg"}
+
+#: Separators a workbook prints inside a number. Stripped before conversion so
+#: "1,200.50" and "１２００" are read as the numbers a reader sees, not dropped
+#: as unparseable text.
+_NUMBER_NOISE = str.maketrans({",": "", "，": "", " ": "", " ": "", "　": ""})
+
+
+def _numeric_frame(
+    frame: pd.DataFrame,
+    metrics: list[AggregateMetric],
+    warnings: list[str],
+) -> pd.DataFrame:
+    """Return ``frame`` with every summed or averaged column read as numbers.
+
+    A column that is already numeric is left untouched. A text one is stripped
+    of thousands separators and converted; cells that still will not convert
+    become missing and are reported, because a total quietly computed over
+    three of five branches is worse than one that says so.
+
+    A column where nothing converts raises: there is no number to be had, and
+    the caller should be told to pick a different column rather than handed a
+    zero.
+    """
+    columns = {item.column for item in metrics if item.function in _ARITHMETIC}
+    if not columns:
+        return frame
+    converted: dict[str, Any] = {}
+    for column in sorted(columns):
+        series = frame[column]
+        if pd.api.types.is_numeric_dtype(series):
+            continue
+        if pd.api.types.is_datetime64_any_dtype(series):
+            raise ValueError(
+                f"列「{column}」是日期列，不能求和或求平均。请换一个数值列，"
+                "或改用 min/max 取最早最晚。"
+            )
+        text = series.astype(str).str.strip().str.translate(_NUMBER_NOISE)
+        # Blank cells are missing data, not failed conversions: an empty row in
+        # a workbook should not be reported as a broken number.
+        blank = series.isna() | text.isin(["", "nan", "None", "NaT", "-", "—"])
+        numbers = pd.to_numeric(text, errors="coerce")
+        unconvertible = (~blank) & numbers.isna()
+        failed = int(unconvertible.sum())
+        usable = int(numbers.notna().sum())
+        if usable == 0:
+            samples = series[~blank].astype(str).head(3).tolist()
+            raise ValueError(
+                f"列「{column}」不是数值列，无法求和或求平均"
+                + (f"（例如 {'、'.join(samples)}）" if samples else "")
+                + "。请改用该 sheet 中的数值列。"
+            )
+        if failed:
+            samples = series[unconvertible].astype(str).head(3).tolist()
+            warnings.append(
+                f"列「{column}」以文本存储，已按数值解析；其中 {failed} 行无法解析已按空值处理"
+                f"（例如 {'、'.join(samples)}）"
+            )
+        else:
+            warnings.append(f"列「{column}」以文本存储，已按数值解析后再聚合")
+        converted[column] = numbers
+    return frame.assign(**converted) if converted else frame
 
 
 def _apply(series: Any, function: str) -> Any:

@@ -42,3 +42,12 @@ backend/**/__pycache__/
 
 # MS Office lock files
 ~$*
+
+# Deployment
+# JDBC 驱动 jar 由内网提供，随镜像包一起搬运，不进仓库。
+deploy/jdbc/*.jar
+# docker save 出来的镜像包。
+*.tar.gz
+
+# 打包产物
+dist/

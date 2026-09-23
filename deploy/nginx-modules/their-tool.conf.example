@@ -1,0 +1,28 @@
+# 复制成 <工具名>.conf 后生效。.example 结尾的不会被 include 进去。
+#
+# their-backend 是对方容器在 compose 网络里的服务名，不是 IP。同一个网络里
+# 直接按服务名解析，对方重启换了容器 IP 也不受影响。
+
+location /api/their-tool/v1/ {
+    # 一定要走变量。直接写 proxy_pass http://their-backend:8000; 的话，
+    # nginx 会在启动时解析这个名字，对方容器还没部署就整个网关起不来 ——
+    # 连登录页和别的团队的工具一起挂掉。走变量是请求时才解析，对方没起来
+    # 就只是这一条路径 502。
+    set $their_backend their-backend;
+    proxy_pass http://$their_backend:8000;
+    proxy_http_version 1.1;
+
+    # 这几个头要带上：对方后端如果要记谁在调用、或者做审计日志，
+    # 没有这些就只能看到网关容器的 IP。
+    proxy_set_header Host              $host;
+    proxy_set_header X-Real-IP         $remote_addr;
+    proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+
+    # Authorization 头默认就会透传，不用显式写。对方用同一个 AUTH_SECRET
+    # 验签就能拿到用户身份 —— 别在这里改写或剥掉它。
+
+    proxy_connect_timeout 10s;
+    proxy_send_timeout    600s;
+    proxy_read_timeout    600s;
+}

@@ -4,31 +4,49 @@ import asyncio
 import json
 import logging
 
-from fastapi import APIRouter, HTTPException, Request, UploadFile
+from fastapi import APIRouter, Depends, HTTPException, Request, UploadFile
 
 from ...core.conversations import CreateConversationRequest
-from ...core.models import RequestContext
 from ...dependencies import get_conversation_orchestrator
+from ..deps import forbid_unless_owner, owner_id
 
 router = APIRouter(prefix="/conversations", tags=["conversations"])
 logger = logging.getLogger(__name__)
 
 
+async def _owned(conversation_id: str, caller: str) -> None:
+    """Refuse a conversation the caller did not start.
+
+    Every by-id route goes through this. A thread carries the user's report and
+    everything they said to get it, so "unknown id" and "someone else's id" are
+    deliberately the same 404.
+    """
+    try:
+        conversation = await get_conversation_orchestrator().get_conversation(conversation_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="会话不存在") from exc
+    forbid_unless_owner(conversation.user_id, caller, "会话")
+
+
 @router.post("")
-async def create_conversation(request: CreateConversationRequest | None = None):
+async def create_conversation(
+    request: CreateConversationRequest | None = None,
+    caller: str = Depends(owner_id),
+):
     return await get_conversation_orchestrator().create_conversation(
-        user_id=RequestContext().user.id,
+        user_id=caller,
         title=request.title if request else None,
     )
 
 
 @router.get("")
-async def list_conversations():
-    return await get_conversation_orchestrator().list_conversations(RequestContext().user.id)
+async def list_conversations(caller: str = Depends(owner_id)):
+    return await get_conversation_orchestrator().list_conversations(caller)
 
 
 @router.get("/{conversation_id}")
-async def get_conversation(conversation_id: str):
+async def get_conversation(conversation_id: str, caller: str = Depends(owner_id)):
+    await _owned(conversation_id, caller)
     try:
         return await get_conversation_orchestrator().get_detail(conversation_id)
     except KeyError as exc:
@@ -36,13 +54,14 @@ async def get_conversation(conversation_id: str):
 
 
 @router.delete("/{conversation_id}")
-async def delete_conversation(conversation_id: str):
+async def delete_conversation(conversation_id: str, caller: str = Depends(owner_id)):
+    await _owned(conversation_id, caller)
     await get_conversation_orchestrator().delete_conversation(conversation_id)
     return {"deleted": True}
 
 
 @router.post("/{conversation_id}/cancel")
-async def cancel_generation(conversation_id: str):
+async def cancel_generation(conversation_id: str, caller: str = Depends(owner_id)):
     """Stop the run this conversation is driving, keeping its progress.
 
     The stored status is flipped first so the run aborts at its next checkpoint
@@ -50,6 +69,7 @@ async def cancel_generation(conversation_id: str):
     cancelling the task on top of that just makes it stop within a second
     instead of at the end of the current model call.
     """
+    await _owned(conversation_id, caller)
     orchestrator = get_conversation_orchestrator()
     try:
         session = await orchestrator.cancel_generation(conversation_id)
@@ -64,13 +84,14 @@ async def cancel_generation(conversation_id: str):
 
 
 @router.post("/{conversation_id}/messages")
-async def post_message(conversation_id: str, request: Request):
+async def post_message(conversation_id: str, request: Request, caller: str = Depends(owner_id)):
     """The single write path: everything the user does is a message.
 
     Uploads are resolved synchronously so a bad file fails here; the model
     work (planning, revising, generating) runs in the background and its
     output arrives as new assistant messages.
     """
+    await _owned(conversation_id, caller)
     orchestrator = get_conversation_orchestrator()
     try:
         text, files = await _read_message_request(request)

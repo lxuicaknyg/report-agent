@@ -1,0 +1,16 @@
+# 开发用覆盖：把宿主后端的端口暴露到宿主机，给做前端模块的同事用。
+#
+#   docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d backend
+#   cd frontend && pnpm dev
+#
+# 为什么需要这个：模块页面全挂在 requiresAuth 的路由下，同事不登录就看不到
+# 自己的页面；而登录要有宿主后端和 users 库。与其让每个人装一套 Python 环境，
+# 不如直接跑我们已经构建好的镜像。
+#
+# 正式部署**不要**带上这个文件 —— 后端在生产里不应该有对外端口，绕过网关就
+# 绕过了上传大小限制和超时设置。
+
+services:
+  backend:
+    ports:
+      - "${BACKEND_DEV_PORT:-8000}:8000"

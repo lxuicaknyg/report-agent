@@ -70,6 +70,8 @@ POST /api/v1/datasets/{dataset_id}/preview
 
 POST /api/v1/analysis/profile
 POST /api/v1/analysis/query
+
+POST /api/v1/supplements/preview                把粘贴的明细读成表格（只解析，不写状态）
 ```
 
 ### 消息类型

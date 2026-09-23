@@ -8,6 +8,7 @@ from tempfile import gettempdir
 from uuid import uuid4
 
 from ..config import settings
+from ..connections.service import ConnectionService
 from ..core.models import utc_now
 from ..core.ports import ArtifactStore
 from ..core.reports import (
@@ -17,13 +18,17 @@ from ..core.reports import (
     CreateReportGenerationRequest,
     DataSourceMetadata,
     GenerationCancelled,
+    QuestionResolutionInput,
     ReportArtifact,
     ReportGenerationSession,
     ReportGenerationStatus,
     ReportTemplate,
     ResolveQuestionsRequest,
+    UserInputRejected,
     UserQuestion,
+    synthesize_template,
 )
+from ..core.tabular import TableParseError, parse_table
 from ..data.catalog import DataCatalog
 from ..data.sources.excel import ExcelDataSource
 from ..infrastructure.logging import preview
@@ -35,6 +40,12 @@ from .session import ReportSessionRepository, ReportTemplateRepository, StoredRe
 from .template_parser import ReportTemplateParser
 
 logger = logging.getLogger(__name__)
+
+#: The resolutions that put data into a chapter, mapped to what the chapter
+#: writer is told about where it came from. A resolution missing from here —
+#: ``pending``, ``dropped`` — carries nothing, which is what makes membership
+#: the test for "did the user supply this".
+_SUPPLEMENT_SOURCE = {"value": "manual", "sql": "sql", "table": "pasted"}
 
 
 class ReportGenerationService:
@@ -51,6 +62,7 @@ class ReportGenerationService:
         renderer: MarkdownReportRenderer,
         artifact_store: ArtifactStore,
         catalog: DataCatalog,
+        connections: ConnectionService | None = None,
         max_chapter_attempts: int = 3,
     ) -> None:
         self.sessions = sessions
@@ -62,6 +74,9 @@ class ReportGenerationService:
         self.renderer = renderer
         self.artifact_store = artifact_store
         self.catalog = catalog
+        #: Optional: without it a question can still be answered with a typed
+        #: value or dropped, which is the whole flow every test needs.
+        self.connections = connections
         self.max_chapter_attempts = max_chapter_attempts
 
     async def upload_template(
@@ -69,11 +84,16 @@ class ReportGenerationService:
         filename: str,
         content: bytes,
         content_type: str | None = None,
+        *,
+        owner_id: str | None = None,
     ) -> ReportTemplate:
         if not content:
             raise ValueError("Template file is empty")
         template_id = f"template_{uuid4().hex}"
         template = self.template_parser.parse(template_id, filename, content, content_type)
+        # Set after parsing: the parser's job is to read the document, not to
+        # know who sent it.
+        template = template.model_copy(update={"owner_id": owner_id})
         await self.templates.save(StoredReportTemplate(template=template, content=content))
         logger.info("template_uploaded template_id=%s filename=%s sections=%d", template.template_id, filename, len(template.sections))
         return template
@@ -81,13 +101,21 @@ class ReportGenerationService:
     async def get_template(self, template_id: str) -> ReportTemplate:
         return (await self.templates.get(template_id)).template
 
-    async def list_templates(self, offset: int = 0, limit: int = 50) -> tuple[int, list[ReportTemplate]]:
+    async def list_templates(
+        self, offset: int = 0, limit: int = 50, *, owner_id: str | None = None
+    ) -> tuple[int, list[ReportTemplate]]:
         items = [stored.template for stored in await self.templates.list()]
+        if owner_id is not None:
+            items = [item for item in items if item.owner_id == owner_id]
         items.sort(key=lambda item: item.created_at, reverse=True)
         return len(items), items[offset:offset + limit]
 
-    async def list_sessions(self, offset: int = 0, limit: int = 20) -> tuple[int, list[ReportGenerationSession]]:
+    async def list_sessions(
+        self, offset: int = 0, limit: int = 20, *, owner_id: str | None = None
+    ) -> tuple[int, list[ReportGenerationSession]]:
         items = await self.sessions.list()
+        if owner_id is not None:
+            items = [item for item in items if item.user_id == owner_id]
         items.sort(key=lambda item: item.updated_at, reverse=True)
         return len(items), items[offset:offset + limit]
 
@@ -98,11 +126,14 @@ class ReportGenerationService:
         *,
         on_created: Callable[[ReportGenerationSession], Awaitable[None]] | None = None,
     ) -> ReportGenerationSession:
-        if not request.template_id:
-            raise ValueError("template_id is required")
-        if not request.dataset_ids:
-            raise ValueError("At least one dataset_id is required")
-        await self.templates.get(request.template_id)
+        # Neither input is required. A template says which chapters exist; with
+        # no template the model proposes them and the agreed outline becomes
+        # one. Datasets say where the figures come from; with none they are
+        # collected from the user instead.
+        if not request.template_id and self.planner.llm is None:
+            raise ValueError("Planning without a template requires a configured model")
+        if request.template_id:
+            await self.templates.get(request.template_id)
         available = {dataset.dataset_id for dataset in await self.catalog.list_datasets()}
         missing = [dataset_id for dataset_id in request.dataset_ids if dataset_id not in available]
         if missing:
@@ -110,7 +141,9 @@ class ReportGenerationService:
         session = ReportGenerationSession(
             session_id=f"report_{uuid4().hex}",
             user_id=user_id,
-            template_id=request.template_id,
+            # Empty until a conversation-authored outline is adopted, which is
+            # when its synthesized template gets an id.
+            template_id=request.template_id or "",
             dataset_ids=request.dataset_ids,
             instruction=request.instruction,
             title=request.title,
@@ -200,12 +233,14 @@ class ReportGenerationService:
             if resolution.action == "value":
                 value = (resolution.value or "").strip()
                 if not value:
-                    raise ValueError(f"补充值不能为空: {resolution.question_id}")
+                    raise UserInputRejected(f"补充值不能为空: {resolution.question_id}")
                 question.resolution = "value"
                 question.value = value
                 question.note = (resolution.note or "").strip() or None
             elif resolution.action == "sql":
-                raise ValueError("SQL 数据源补充尚未开放，请先填写数值或删除该指标")
+                await self._resolve_by_sql(question, resolution)
+            elif resolution.action == "table":
+                self._resolve_by_paste(question, resolution)
             else:
                 question.resolution = "dropped"
                 self._drop_metric(session, question)
@@ -234,6 +269,94 @@ class ReportGenerationService:
             return await self.start(session_id)
         return session
 
+    async def _resolve_by_sql(
+        self,
+        question: UserQuestion,
+        resolution: QuestionResolutionInput,
+    ) -> None:
+        """Run the user's query and settle the question with what it returned.
+
+        The value is read here rather than taken from the request: the trial
+        run in the question card and this one must agree, and only re-running
+        the statement proves the number was not edited on the way back.
+        """
+        if self.connections is None:
+            raise UserInputRejected("当前部署未启用数据源连接，请改为直接填写数值")
+        shape = self._shape_for(question, resolution)
+        connection_id = (resolution.connection_id or "").strip()
+        if not connection_id:
+            raise UserInputRejected(f"请先选择数据源: {resolution.question_id}")
+        query = (resolution.query or "").strip()
+        if not query:
+            raise UserInputRejected(f"SQL 不能为空: {resolution.question_id}")
+        try:
+            result = await self.connections.query(connection_id, query, shape)
+        except KeyError as exc:
+            raise UserInputRejected(f"数据源不存在: {connection_id}") from exc
+        if not result.success or result.extraction is None or not result.extraction.usable:
+            detail = (result.extraction.error if result.extraction else None) or result.message
+            raise UserInputRejected(f"取数失败：{detail}")
+        found = result.extraction
+        question.resolution = "sql"
+        question.value = found.value
+        question.dimensions = found.dimensions
+        question.columns = found.columns
+        question.rows = found.rows
+        question.rows_truncated = found.truncated
+        question.connection_id = connection_id
+        question.connection_name = result.connection_name or None
+        question.query = query
+        question.note = (resolution.note or "").strip() or None
+        logger.info(
+            "question_resolved_by_sql question_id=%s metric=%s shape=%s connection_id=%s "
+            "dimensions=%s rows=%d truncated=%s",
+            question.question_id, question.metric, found.shape, connection_id,
+            question.dimensions or "-", len(found.rows), found.truncated,
+        )
+
+    @staticmethod
+    def _shape_for(question: UserQuestion, resolution: QuestionResolutionInput) -> str:
+        """How to read the result of the user's query.
+
+        The question already says whether the chapter needs one figure or a
+        list, so the user is not asked to declare it a second time while
+        writing their SQL. ``as_table`` is the correction: a question we
+        classified as a single figure whose query returns a list is read as
+        one, on the user's say-so.
+        """
+        return "table" if question.expected == "table" or resolution.as_table else "value"
+
+    @staticmethod
+    def _resolve_by_paste(
+        question: UserQuestion,
+        resolution: QuestionResolutionInput,
+    ) -> None:
+        """Settle a question with rows the user pasted in.
+
+        Parsed here rather than trusted from the request for the same reason a
+        SQL answer is re-run: the preview the user approved has to be this
+        read of this text, not a second implementation of it in the browser.
+        """
+        text = (resolution.text or "").strip()
+        if not text:
+            raise UserInputRejected(f"粘贴的内容不能为空: {resolution.question_id}")
+        try:
+            parsed = parse_table(text)
+        except TableParseError as exc:
+            raise UserInputRejected(str(exc)) from exc
+        question.resolution = "table"
+        question.value = None
+        question.columns = parsed.columns
+        question.rows = parsed.rows
+        question.rows_truncated = parsed.truncated
+        question.note = (resolution.note or "").strip() or None
+        logger.info(
+            "question_resolved_by_paste question_id=%s metric=%s format=%s columns=%s "
+            "rows=%d truncated=%s",
+            question.question_id, question.metric, parsed.format,
+            parsed.columns, len(parsed.rows), parsed.truncated,
+        )
+
     def _drop_unanswerable(
         self,
         session: ReportGenerationSession,
@@ -251,11 +374,25 @@ class ReportGenerationService:
         """
         dropped: list[str] = []
         already = session.dropped_metrics.get(section.section_id, [])
+        # A metric the user supplied a value for is never given up on: throwing
+        # it away would discard data they typed in themselves, which is worse
+        # than the loop this method exists to break.
+        supplied = {
+            (item.metric or "").strip()
+            for item in session.resolved_questions
+            if item.chapter_id == section.section_id and item.resolution in _SUPPLEMENT_SOURCE
+        }
         for question in questions:
             metric = (question.metric or "").strip()
             if not metric or metric in already:
                 # Nothing left to remove from the plan, so dropping it again
                 # would not stop the chapter asking. Let the caller park.
+                continue
+            if metric in supplied:
+                logger.warning(
+                    "chapter_asked_for_supplied_metric session_id=%s section_id=%s metric=%s",
+                    session.session_id, section.section_id, metric,
+                )
                 continue
             settled = question.model_copy(
                 update={
@@ -390,14 +527,20 @@ class ReportGenerationService:
             raise ValueError("Report plan has not been generated")
         if session.plan.status != "awaiting_confirmation":
             raise ValueError(f"Report plan cannot be revised from status: {session.plan.status}")
-        if session.template_snapshot is None:
-            raise ValueError("Report template snapshot is missing")
-        session.plan = await self.planner.revise_plan(
-            plan=session.plan,
-            template=session.template_snapshot,
-            data_sources=session.data_source_metadata,
-            feedback=feedback,
-        )
+        if self._is_synthesized(session):
+            # The conversation owns the structure here, so a revision may add or
+            # drop chapters; the template is rebuilt from the result.
+            session.plan = await self.planner.revise_outline(plan=session.plan, feedback=feedback)
+            self._adopt_outline(session)
+        else:
+            if session.template_snapshot is None:
+                raise ValueError("Report template snapshot is missing")
+            session.plan = await self.planner.revise_plan(
+                plan=session.plan,
+                template=session.template_snapshot,
+                data_sources=session.data_source_metadata,
+                feedback=feedback,
+            )
         session.title = session.plan.title
         session.status = ReportGenerationStatus.AWAITING_CONFIRMATION
         session.current_step = "await_plan_confirmation"
@@ -493,11 +636,20 @@ class ReportGenerationService:
                         # chapter needs, so label it with what was asked.
                         ChapterSupplement(
                             metric=item.metric or item.content,
+                            source=_SUPPLEMENT_SOURCE[item.resolution],
                             value=item.value,
                             note=item.note,
+                            dimensions=item.dimensions,
+                            columns=item.columns,
+                            rows=item.rows,
+                            rows_truncated=item.rows_truncated,
+                            connection_id=item.connection_id,
+                            connection_name=item.connection_name,
+                            query=item.query,
                         )
                         for item in session.resolved_questions
-                        if item.chapter_id == section.section_id and item.resolution == "value"
+                        if item.chapter_id == section.section_id
+                        and item.resolution in _SUPPLEMENT_SOURCE
                     ],
                     dropped_metrics=list(session.dropped_metrics.get(section.section_id, [])),
                 )
@@ -584,7 +736,7 @@ class ReportGenerationService:
         return session
 
     async def _prepare_plan(self, session: ReportGenerationSession) -> ReportGenerationSession:
-        if session.template_snapshot is None:
+        if session.template_snapshot is None and session.template_id:
             session.current_step = "parse_template"
             stored = await self.templates.get(session.template_id)
             session.template_snapshot = self.template_parser.parse(
@@ -599,16 +751,45 @@ class ReportGenerationService:
             session.data_source_metadata = await self._build_data_source_metadata(session.dataset_ids)
 
         session.current_step = "create_plan"
-        session.plan = await self.planner.create_plan(
-            template=session.template_snapshot,
-            instruction=session.instruction,
-            data_sources=session.data_source_metadata,
-            title=session.title,
-        )
+        if session.template_snapshot is None:
+            # Nothing to follow: the model proposes the structure, and the
+            # agreed structure becomes the template everything downstream reads.
+            session.plan = await self.planner.create_outline(
+                instruction=session.instruction,
+                data_sources=session.data_source_metadata,
+                title=session.title,
+            )
+            self._adopt_outline(session)
+        else:
+            session.plan = await self.planner.create_plan(
+                template=session.template_snapshot,
+                instruction=session.instruction,
+                data_sources=session.data_source_metadata,
+                title=session.title,
+            )
         session.status = ReportGenerationStatus.AWAITING_CONFIRMATION
         await self._save(session)
         logger.info("report_plan_created session_id=%s sections=%d", session.session_id, len(session.plan.sections))
         return session
+
+    @staticmethod
+    def _is_synthesized(session: ReportGenerationSession) -> bool:
+        """Whether this report's structure came from the conversation."""
+        snapshot = session.template_snapshot
+        return bool(snapshot and snapshot.metadata.get("synthesized"))
+
+    def _adopt_outline(self, session: ReportGenerationSession) -> None:
+        """Rebuild the template from the plan just agreed.
+
+        Regenerating rather than patching is what stops the two from drifting:
+        the template cannot keep a chapter the plan no longer has.
+        """
+        template_id = session.template_id or f"template_{uuid4().hex}"
+        session.template_snapshot = synthesize_template(
+            template_id, session.plan.title, session.plan.chapters
+        )
+        session.template_id = template_id
+        session.plan.template_id = template_id
 
     async def _build_data_source_metadata(self, dataset_ids: list[str]) -> list[DataSourceMetadata]:
         datasets = {dataset.dataset_id: dataset for dataset in await self.catalog.list_datasets()}
@@ -717,7 +898,9 @@ class ReportGenerationService:
                 break
         return rows
 
-    async def register_excel_dataset(self, filename: str, content: bytes) -> str:
+    async def register_excel_dataset(
+        self, filename: str, content: bytes, *, owner_id: str | None = None
+    ) -> str:
         data_dir = settings.data_dir
         try:
             data_dir.mkdir(parents=True, exist_ok=True)
@@ -729,7 +912,10 @@ class ReportGenerationService:
         data_path = data_dir / f"{dataset_id}_{safe_filename}"
         data_path.write_bytes(content)
         try:
-            self.catalog.register(ExcelDataSource(path=data_path, dataset_id=dataset_id, name=safe_filename))
+            self.catalog.register(
+                ExcelDataSource(path=data_path, dataset_id=dataset_id, name=safe_filename),
+                owner_id=owner_id,
+            )
         except Exception:
             data_path.unlink(missing_ok=True)
             raise

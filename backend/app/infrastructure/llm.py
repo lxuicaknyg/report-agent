@@ -122,8 +122,6 @@ class OpenAICompatibleLlmService(LlmService):
     ) -> None:
         if not base_url:
             raise ValueError("LLM_BASE_URL is required")
-        if not api_key:
-            raise ValueError("LLM_API_KEY is required")
         if not model:
             raise ValueError("LLM_MODEL_NAME is required")
         if max_attempts < 1:
@@ -144,8 +142,20 @@ class OpenAICompatibleLlmService(LlmService):
         # max_retries=0 leaves this class as the only place that retries.
         # The SDK's own two attempts would otherwise multiply with ours, and a
         # bad request would be sent nine times before anyone heard about it.
+        # An on-premise gateway commonly fronts the model with no auth at all,
+        # while the SDK refuses to construct without *some* key. "EMPTY" is the
+        # placeholder vLLM and its lookalikes document for this case, so a
+        # keyless gateway works without the deployment having to invent a key.
+        #
+        # Requiring a key here used to break far more than the model calls: the
+        # connection service builds its SQL tool from this client eagerly, so an
+        # empty LLM_API_KEY turned every /connections and /conversations request
+        # into a 500.
         self.client = AsyncOpenAI(
-            base_url=base_url.rstrip("/"), api_key=api_key, timeout=timeout, max_retries=0
+            base_url=base_url.rstrip("/"),
+            api_key=api_key or "EMPTY",
+            timeout=timeout,
+            max_retries=0,
         )
 
     async def _stream_once(self, request: dict[str, Any]) -> dict[str, Any]:

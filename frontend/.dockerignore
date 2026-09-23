@@ -1,0 +1,13 @@
+# Installed inside the image from the lockfile. Copying the host's tree in
+# would both bloat the build context and risk shipping native modules built for
+# the wrong platform.
+node_modules/
+dist/
+
+.env
+.env.*
+!.env.example
+
+*.md
+.vscode/
+.idea/

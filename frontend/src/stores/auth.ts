@@ -1,11 +1,14 @@
 import { defineStore } from 'pinia'
 import { computed, ref } from 'vue'
+import { authApi } from '../services/api/auth'
 
 const LS_KEY = 'report-agent:auth-v1'
 
 export interface AuthUser {
   id: string
   username: string
+  role?: string
+  workspace?: string | null
   avatar?: string | null
 }
 
@@ -27,7 +30,13 @@ function loadFromLS(): AuthSnapshot {
     return {
       token: parsed.token ?? null,
       user: parsed.user && typeof parsed.user === 'object' && parsed.user.id && parsed.user.username
-        ? { id: String(parsed.user.id), username: String(parsed.user.username), avatar: parsed.user.avatar ?? null }
+        ? {
+            id: String(parsed.user.id),
+            username: String(parsed.user.username),
+            role: parsed.user.role ?? 'user',
+            workspace: parsed.user.workspace ?? null,
+            avatar: parsed.user.avatar ?? null,
+          }
         : null,
       expiresAt: typeof parsed.expiresAt === 'number' ? parsed.expiresAt : null,
       loggedInAt: typeof parsed.loggedInAt === 'number' ? parsed.loggedInAt : null,
@@ -69,22 +78,24 @@ export const useAuthStore = defineStore('auth', () => {
     }
   }
 
-  async function login(uname: string, _password: string) {
-    const name = (uname || 'admin').trim() || 'admin'
-    const newToken = `fake-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
-    const fakeUser: AuthUser = { id: `local-${name}`, username: name, avatar: null }
-    const expires = Date.now() + 1000 * 60 * 60 * 12
-    token.value = newToken
-    user.value = fakeUser
-    expiresAt.value = expires
-    loggedInAt.value = Date.now()
-    loaded = true
-    persist({
-      token: newToken,
-      user: fakeUser,
-      expiresAt: expires,
-      loggedInAt: loggedInAt.value,
-    })
+  /** Sign in against the users table. Throws with the backend's reason. */
+  async function login(uname: string, password: string) {
+    const result = await authApi.login((uname || '').trim(), password)
+    if (!result.success || !result.data) {
+      throw new Error(result.error?.message || '登录失败，请重试')
+    }
+    const { token: nextToken, expires_at: expires, user: account } = result.data
+    setJwtAuth(
+      nextToken,
+      {
+        id: String(account.id),
+        username: account.username,
+        role: account.role,
+        workspace: account.workspace ?? null,
+        avatar: null,
+      },
+      expires,
+    )
     return true
   }
 

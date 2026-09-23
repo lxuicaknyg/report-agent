@@ -1,4 +1,4 @@
-import { apiClient } from './client'
+import { hostApi } from './client'
 import type {
   ApiResult,
   DatasetInfo,
@@ -11,27 +11,27 @@ import type {
 
 export const datasetApi = {
   listDatasets(): Promise<ApiResult<DatasetInfo[]>> {
-    return apiClient.get<DatasetInfo[]>('/datasets')
+    return hostApi.get<DatasetInfo[]>('/datasets')
   },
 
   uploadExcel(file: File): Promise<ApiResult<DatasetInfo>> {
-    return apiClient.upload<DatasetInfo>('/datasets/excel', file)
+    return hostApi.upload<DatasetInfo>('/datasets/excel', file)
   },
 
   registerSql(payload: SqlRegisterRequest): Promise<ApiResult<DatasetInfo>> {
-    return apiClient.post<DatasetInfo>('/datasets/sql', payload)
+    return hostApi.post<DatasetInfo>('/datasets/sql', payload)
   },
 
   listSheets(datasetId: string): Promise<ApiResult<SheetInfo[]>> {
-    return apiClient.get<SheetInfo[]>(`/datasets/${datasetId}/sheets`)
+    return hostApi.get<SheetInfo[]>(`/datasets/${datasetId}/sheets`)
   },
 
   getSchema(datasetId: string, sheetName?: string | null): Promise<ApiResult<ColumnSchema[]>> {
     const qs = sheetName ? `?sheet_name=${encodeURIComponent(sheetName)}` : ''
-    return apiClient.get<ColumnSchema[]>(`/datasets/${datasetId}/schema${qs}`)
+    return hostApi.get<ColumnSchema[]>(`/datasets/${datasetId}/schema${qs}`)
   },
 
   previewDataset(datasetId: string, request: DataReadRequest): Promise<ApiResult<DataReadResult>> {
-    return apiClient.post<DataReadResult>(`/datasets/${datasetId}/preview`, request)
+    return hostApi.post<DataReadResult>(`/datasets/${datasetId}/preview`, request)
   },
 }

@@ -21,28 +21,6 @@ class ConnectionRepository(ABC):
     async def delete(self, connection_id: str) -> None: ...
 
 
-class InMemoryConnectionRepository(ConnectionRepository):
-    def __init__(self) -> None:
-        self._items: dict[str, DataConnection] = {}
-
-    async def save(self, connection: DataConnection) -> None:
-        self._items[connection.connection_id] = connection.model_copy(deep=True)
-
-    async def get(self, connection_id: str) -> DataConnection:
-        try:
-            return self._items[connection_id].model_copy(deep=True)
-        except KeyError as exc:
-            raise KeyError(f"Data connection not found: {connection_id}") from exc
-
-    async def list(self) -> list[DataConnection]:
-        return [item.model_copy(deep=True) for item in self._items.values()]
-
-    async def delete(self, connection_id: str) -> None:
-        if connection_id not in self._items:
-            raise KeyError(f"Data connection not found: {connection_id}")
-        del self._items[connection_id]
-
-
 class PersistentConnectionRepository(ConnectionRepository):
     """JSON-backed store, same approach as report sessions.
 

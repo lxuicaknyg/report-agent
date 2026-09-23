@@ -119,15 +119,30 @@ export const useConversationStore = defineStore('conversation', () => {
     return result.data
   }
 
+  /** Drop back to an empty draft without touching the server.
+   *
+   * A thread the user never wrote in should not exist, so /conversations/new
+   * and the aftermath of a deletion both land here rather than creating one.
+   */
+  function resetDraft() {
+    stopPolling()
+    currentConversationId.value = null
+    messages.value = []
+    reportSession.value = null
+    error.value = null
+  }
+
   async function sendMessage(input: PostMessageInput): Promise<boolean> {
-    const conversationId = currentConversationId.value
-    if (!conversationId) {
-      error.value = '当前会话尚未准备完成，请稍后重试'
-      return false
-    }
     isSending.value = true
     error.value = null
     try {
+      // A draft becomes a real thread the moment it has something to hold.
+      const conversationId =
+        currentConversationId.value ?? (await createConversation())?.conversation_id
+      if (!conversationId) {
+        error.value = error.value || '会话创建失败，请重试'
+        return false
+      }
       const result = await conversationApi.postMessage(conversationId, input)
       if (!result.success || !result.data) {
         error.value = result.error?.message || '消息发送失败，请重试'
@@ -194,6 +209,7 @@ export const useConversationStore = defineStore('conversation', () => {
     refresh,
     selectConversation,
     createConversation,
+    resetDraft,
     sendMessage,
     cancelGeneration,
     deleteConversation,

@@ -1,128 +1,72 @@
 <script setup lang="ts">
-import { computed, onMounted, ref, watch } from 'vue'
+import { computed, nextTick, onMounted, onUnmounted, ref } from 'vue'
 import { RouterView, useRoute, useRouter } from 'vue-router'
-import { useAuthStore, useConversationStore } from '../stores'
-import type { Conversation } from '../types'
+import { moduleNavItems } from '../app/modules'
+import { useAuthStore } from '../stores'
 
 const route = useRoute()
 const router = useRouter()
 const authStore = useAuthStore()
-const conversationStore = useConversationStore()
 
-const SIDEBAR_STATE_KEY = 'report-agent:sidebar-open-v1'
-const showSidebar = ref(true)
+const NOTICE_TEXT = '请勿上传或处理敏感、涉密数据。本平台内容由 AI 生成，仅供参考。'
+
+/* ── 顶栏提示语：跑马灯常滚 ── */
+
+/** 滚动速度，px/s。定速而非定时长，否则文案一改快慢就变了。 */
+const NOTICE_SPEED = 45
+
+const noticeRef = ref<HTMLElement | null>(null)
+const noticeTextRef = ref<HTMLElement | null>(null)
+let noticeObserver: ResizeObserver | null = null
+
+function measureNotice() {
+  const box = noticeRef.value
+  const text = noticeTextRef.value
+  if (!box || !text) return
+  // 一个单位 = 一份文本 + 它的尾部间隔，位移正好这么多就能接回原位。
+  const unit = text.getBoundingClientRect().width
+  if (unit <= 0) return
+  box.style.setProperty('--notice-unit', `${unit}px`)
+  box.style.setProperty('--notice-duration', `${(unit / NOTICE_SPEED).toFixed(1)}s`)
+}
 
 const userInitial = computed(() =>
   (authStore.username || 'A').slice(0, 1).toUpperCase(),
 )
 
-const sessions = computed(() => conversationStore.conversations)
-const currentSessionId = computed(() => {
-  const id = route.params.conversationId as string | undefined
-  return id ?? conversationStore.currentConversationId
-})
+/**
+ * The top bar is the only thing a contributed tool shares with this app, so the
+ * entries after 报告生成 come straight from the module registry: registering a
+ * tool puts it in the bar, and the bar needs to know nothing about it.
+ */
+const navItems = computed(() => [
+  { key: 'reports', label: '报告生成', to: { name: 'conversation-new' } },
+  ...moduleNavItems(),
+])
 
-const sortedSessions = computed(() => {
-  return [...sessions.value].sort((a, b) => {
-    const ta = a.updated_at ? new Date(a.updated_at).getTime() : 0
-    const tb = b.updated_at ? new Date(b.updated_at).getTime() : 0
-    return tb - ta
-  })
-})
-
-const isConversationRoute = computed(
-  () =>
-    route.name === 'conversations' ||
-    route.name === 'conversation-new' ||
-    route.name === 'conversation-detail',
+/** Routes declare which top-bar entry owns them; the path is a last resort. */
+const activeNav = computed(() =>
+  String(route.meta.nav || route.path.split('/')[1] || ''),
 )
 
-const activeNav = computed(() => {
-  if (isConversationRoute.value) return 'reports'
-  return String(route.meta.nav || route.path.split('/')[1] || '')
-})
-
 onMounted(async () => {
-  try {
-    const saved = localStorage.getItem(SIDEBAR_STATE_KEY)
-    if (saved === '0') showSidebar.value = false
-  } catch {
-    /* ignore */
-  }
-  try {
-    await conversationStore.loadConversations()
-  } catch {
-    /* ignore — 后端暂无路由时 LS 兜底 */
-  }
+  await nextTick()
+  measureNotice()
+  // Chinese glyphs land at a different width once the webfont swaps in, which
+  // decides whether this line overflows at all.
+  void document.fonts?.ready.then(measureNotice)
+  noticeObserver = new ResizeObserver(measureNotice)
+  if (noticeRef.value) noticeObserver.observe(noticeRef.value)
 })
 
-watch(showSidebar, (v) => {
-  try {
-    localStorage.setItem(SIDEBAR_STATE_KEY, v ? '1' : '0')
-  } catch {
-    /* ignore */
-  }
+onUnmounted(() => {
+  noticeObserver?.disconnect()
+  noticeObserver = null
 })
 
 async function handleLogout() {
   authStore.logout()
   await router.push('/login')
-}
-
-async function handleNewSession() {
-  const s = await conversationStore.createConversation()
-  if (s) {
-    await router.push({
-      name: 'conversation-detail',
-      params: { conversationId: s.conversation_id },
-    })
-  } else {
-    await router.push({ name: 'conversation-new' })
-  }
-}
-
-function openSession(s: Conversation) {
-  router.push({
-    name: 'conversation-detail',
-    params: { conversationId: s.conversation_id },
-  })
-}
-
-function toggleSidebar() {
-  showSidebar.value = !showSidebar.value
-}
-
-async function handleDeleteSession(
-  sessionId: string,
-  sessionTitle: string,
-) {
-  const ok = window.confirm(
-    `确定删除会话「${sessionTitle || '新会话'}」吗？此操作不可撤销。`,
-  )
-  if (!ok) return
-  const wasActive =
-    currentSessionId.value === sessionId && isConversationRoute.value
-  await conversationStore.deleteConversation(sessionId)
-  if (wasActive) {
-    await router.push({ name: 'conversation-new' })
-  }
-}
-
-function formatTime(s: Conversation): string {
-  if (!s.updated_at) return ''
-  try {
-    const d = new Date(s.updated_at)
-    const today = new Date()
-    const sameDay = d.toDateString() === today.toDateString()
-    if (sameDay) {
-      return `${String(d.getHours()).padStart(2, '0')}:${String(
-        d.getMinutes(),
-      ).padStart(2, '0')}`
-    }
-    return `${d.getMonth() + 1}/${d.getDate()}`
-  } catch {
-    return ''
-  }
 }
 </script>
 
@@ -141,155 +85,38 @@ function formatTime(s: Conversation): string {
 
       <nav class="primary-nav" aria-label="主导航">
         <RouterLink
-          :to="{ name: 'conversation-new' }"
+          v-for="item in navItems"
+          :key="item.key"
+          :to="item.to"
           class="primary-nav-item"
-          :class="{ active: activeNav === 'reports' }"
-          >报告生成</RouterLink
-        >
-        <span
-          class="primary-nav-item disabled"
-          title="历史记录接口尚未开放"
-          >报告记录</span
-        >
-        <span
-          class="primary-nav-item disabled"
-          title="能力目录暂未开放为独立页面"
-          >能力目录</span
+          :class="{ active: activeNav === item.key }"
+          >{{ item.label }}</RouterLink
         >
       </nav>
 
-      <div class="account-area">
-        <span class="avatar" aria-hidden="true">{{ userInitial }}</span>
-        <span class="account-name">{{ authStore.username || '管理员' }}</span>
-        <button
-          class="logout-button"
-          type="button"
-          @click="handleLogout"
-        >退出</button>
+      <div class="top-bar-trail">
+        <div ref="noticeRef" class="top-notice" :title="NOTICE_TEXT">
+          <div class="top-notice-track">
+            <!-- 两份相同文本首尾相接，位移一个单位即可无缝循环 -->
+            <span ref="noticeTextRef" class="top-notice-text">{{ NOTICE_TEXT }}</span>
+            <span class="top-notice-text" aria-hidden="true">{{ NOTICE_TEXT }}</span>
+          </div>
+        </div>
+
+        <div class="account-area">
+          <span class="avatar" aria-hidden="true">{{ userInitial }}</span>
+          <span class="account-name">{{ authStore.username || '未登录' }}</span>
+          <button
+            class="logout-button"
+            type="button"
+            @click="handleLogout"
+          >退出</button>
+        </div>
       </div>
     </header>
 
-    <div class="workspace-body">
-      <!-- 侧栏：单态会话列表，严格截图 -->
-      <aside
-        class="sidebar"
-        aria-label="会话侧边栏"
-        :class="{ collapsed: !showSidebar }"
-      >
-        <div class="sidebar-inner">
-          <div class="sidebar-section sidebar-top">
-            <button
-              type="button"
-              class="new-session-btn"
-              @click="handleNewSession"
-            >
-              <span>新会话</span>
-            </button>
-            <RouterLink
-              :to="{ name: 'connections' }"
-              class="sidebar-link"
-              :class="{ active: activeNav === 'connections' }"
-            >
-              <span class="sidebar-link-icon" aria-hidden="true">
-                <svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.4">
-                  <ellipse cx="8" cy="3.6" rx="5.2" ry="2.1" />
-                  <path d="M2.8 3.6v8.8c0 1.16 2.33 2.1 5.2 2.1s5.2-.94 5.2-2.1V3.6" />
-                  <path d="M2.8 8c0 1.16 2.33 2.1 5.2 2.1s5.2-.94 5.2-2.1" />
-                </svg>
-              </span>
-              <span>数据源</span>
-            </RouterLink>
-          </div>
-
-          <div class="sidebar-section">
-            <div class="section-label">最近</div>
-            <div class="session-list">
-              <div v-if="sortedSessions.length === 0" class="session-empty">
-                暂无会话
-              </div>
-              <div
-                v-for="s in sortedSessions"
-                :key="s.conversation_id"
-                class="session-item-wrap"
-              >
-                <button
-                  type="button"
-                  class="session-item"
-                  :class="{
-                    active: currentSessionId === s.conversation_id && isConversationRoute,
-                  }"
-                  @click="openSession(s)"
-                  :title="s.title"
-                >
-                  <span class="session-title">{{ s.title }}</span>
-                  <span class="session-time">{{ formatTime(s) }}</span>
-                </button>
-                <button
-                  type="button"
-                  class="session-delete"
-                  title="删除会话"
-                  aria-label="删除会话"
-                  @click.stop="handleDeleteSession(s.conversation_id, s.title)"
-                >
-                  <svg
-                    viewBox="0 0 24 24"
-                    width="14"
-                    height="14"
-                    fill="none"
-                    stroke="currentColor"
-                    stroke-width="2"
-                    stroke-linecap="round"
-                    stroke-linejoin="round"
-                    aria-hidden="true"
-                  >
-                    <polyline points="3 6 5 6 21 6" />
-                    <path
-                      d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"
-                    />
-                    <path d="M10 11v6" />
-                    <path d="M14 11v6" />
-                    <path
-                      d="M9 6V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2"
-                    />
-                  </svg>
-                </button>
-              </div>
-            </div>
-          </div>
-        </div>
-      </aside>
-
-      <!-- sb-toggle 半胶囊，严格 240/0 切换 -->
-      <button
-        type="button"
-        class="sb-toggle"
-        :style="{ left: showSidebar ? '240px' : '0px' }"
-        :title="showSidebar ? '收起会话栏' : '展开会话栏'"
-        aria-label="切换会话栏"
-        @click="toggleSidebar"
-      >
-        <svg
-          class="toggle-arrow"
-          :class="{ flip: !showSidebar }"
-          viewBox="0 0 24 24"
-          width="12"
-          height="12"
-          fill="none"
-          stroke="currentColor"
-          stroke-width="2.5"
-          stroke-linecap="round"
-          stroke-linejoin="round"
-          aria-hidden="true"
-        >
-          <path d="M15 18l-6-6 6-6" />
-        </svg>
-      </button>
-
-      <!-- 主区域：对话页 no-pad（内嵌滚动），其余页面维持 padding -->
-      <main class="main-area" :class="{ 'no-pad': isConversationRoute }">
-        <RouterView />
-      </main>
-    </div>
+    <!-- 顶栏之下由路由决定：报告工作台自带会话侧栏，能力目录下的工具只继承顶栏。 -->
+    <RouterView />
   </div>
 </template>
 
@@ -301,14 +128,6 @@ function formatTime(s: Conversation): string {
   overflow: hidden;
   background: var(--color-bg-app, #f7f5fb);
 }
-
-.workspace-body {
-  flex: 1;
-  display: flex;
-  min-height: 0;
-  overflow: hidden;
-}
-
 /* ── 顶栏 58px：严格 ai-report-dev 截图 ── */
 .top-bar {
   height: 58px;
@@ -316,60 +135,141 @@ function formatTime(s: Conversation): string {
   background: #fff;
   border-bottom: 1px solid
     var(--color-primary-border, rgba(111, 50, 155, 0.14));
-  display: flex;
+  /* 三栏网格：左右列用 minmax(0, 1fr) 强制等宽，导航才落在顶栏真正的中线上。
+     用 flex + justify-content:center 只能在导航自己那段空间里居中，
+     而左侧品牌区比右侧账号区宽得多，结果是偏右的。 */
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
   align-items: center;
   padding: 0 24px;
   gap: 24px;
 }
-
+/* 右栏：提示语 + 账号区。账号区靠最右，提示语占它左边的剩余空间 */
+.top-bar-trail {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 20px;
+  min-width: 0;
+  /* 空间不够时先吃掉提示语，而不是把账号区顶出格 */
+  overflow: hidden;
+}
 .brand-area {
   display: inline-flex;
   align-items: center;
   gap: 12px;
   min-width: 0;
+  /* 品牌区不参与压缩：标题被截断比提示语变窄更糟 */
+  flex-shrink: 0;
+}
+/* 合规提示：跑马灯常滚，顶栏挤不下时由它独自让位 */
+.top-notice {
+  flex: 1 1 auto;
+  min-width: 0;
+  max-width: 460px;
+  overflow: hidden;
+  font-size: 13.5px;
+  font-weight: 500;
+  color: var(--color-error);
+}
+.top-notice-track {
+  display: flex;
+  width: max-content;
+  animation: notice-marquee var(--notice-duration, 8s) linear infinite;
+}
+/* 想看清整句时停一下 */
+.top-notice:hover .top-notice-track {
+  animation-play-state: paused;
+}
+.top-notice-text {
+  white-space: nowrap;
+  /* 间隔算进单位宽度里，位移一个单位才能严丝合缝地接上 */
+  padding-right: 48px;
 }
 
+@keyframes notice-marquee {
+  to { transform: translateX(calc(-1 * var(--notice-unit, 0px))); }
+}
+/* 先牺牲英文名：中文名是主标识、提示语是合规要求，都比它重要。
+   去掉它之后品牌区约 332px，等宽列到 1050px 都还放得下，居中得以保留。 */
+@media (max-width: 1200px) {
+  .brand-copy-en {
+    display: none;
+  }
+}
+/* 再窄就放弃严格居中：等宽列已经容不下品牌区，会把产品名裁掉。
+   导航偏移可以接受，产品名被截断不行。 */
+@media (max-width: 1050px) {
+  .top-bar {
+    display: flex;
+  }
+
+  .primary-nav {
+    flex: 1;
+  }
+}
+/* 关掉动效时不跑马灯，改成可手动横向滚动，并且只留一份文本 */
+@media (prefers-reduced-motion: reduce) {
+  .top-notice {
+    overflow-x: auto;
+  }
+
+  .top-notice-track {
+    animation: none !important;
+    transform: none !important;
+  }
+
+  .top-notice-text + .top-notice-text {
+    display: none;
+  }
+}
 .brand-logo {
   height: 28px;
   width: auto;
   display: block;
 }
-
 .brand-divider {
   width: 1px;
   height: 22px;
   background: var(--color-border, #e9e6ef);
 }
-
 .brand-copy {
   display: inline-flex;
   align-items: baseline;
   gap: 8px;
+  min-width: 0;
   font-size: 18px;
   color: var(--color-text-dark, #102a43);
   letter-spacing: 0.3px;
 }
-
+.brand-copy strong {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 .brand-copy-en {
+  flex-shrink: 0;
+  white-space: nowrap;
   font-size: 11px;
   font-weight: 500;
   color: var(--color-text-light, #9ca3af);
   letter-spacing: 0.4px;
 }
-
+/* 网格中间列，宽度由内容决定 —— 居中交给 minmax(0,1fr) 的左右列 */
 .primary-nav {
-  flex: 1;
   display: inline-flex;
   align-items: center;
   justify-content: center;
   gap: 8px;
 }
-
 .primary-nav-item {
   display: inline-flex;
   align-items: center;
   height: 36px;
   padding: 0 18px;
+  /* 没有 nowrap 时中文的 min-content 宽是一个字，顶栏一挤导航就会被压成竖排 */
+  white-space: nowrap;
+  flex-shrink: 0;
   border-radius: 8px;
   font-size: 14px;
   font-weight: 500;
@@ -379,31 +279,21 @@ function formatTime(s: Conversation): string {
   cursor: pointer;
   font-family: inherit;
 }
-
-.primary-nav-item:hover:not(.disabled) {
+.primary-nav-item:hover {
   background: var(--color-primary-light);
   color: var(--color-primary);
 }
-
 .primary-nav-item.active {
   background: var(--color-primary-light);
   color: var(--color-primary);
   font-weight: 600;
 }
-
-.primary-nav-item.disabled {
-  color: var(--color-text-light, #9ca3af);
-  opacity: 0.55;
-  cursor: not-allowed;
-}
-
 .account-area {
   display: inline-flex;
   align-items: center;
   gap: 10px;
   flex-shrink: 0;
 }
-
 .account-area .avatar {
   width: 32px;
   height: 32px;
@@ -416,13 +306,11 @@ function formatTime(s: Conversation): string {
   font-weight: 700;
   font-size: 13px;
 }
-
 .account-name {
   font-size: 13px;
   color: var(--color-text-medium);
   font-weight: 500;
 }
-
 .logout-button {
   border: 1px solid var(--color-border, #e4e1ea);
   background: #fff;
@@ -434,281 +322,11 @@ function formatTime(s: Conversation): string {
   font-family: inherit;
   transition: all 0.15s ease;
 }
-
 .logout-button:hover {
   border-color: var(--color-primary);
   color: var(--color-primary);
 }
-
 /* ── 侧边栏 240px 单态会话列表，严格 ai-report-dev ── */
-.sidebar {
-  width: 240px;
-  flex-shrink: 0;
-  background: var(--color-bg-sidebar, #faf8fc);
-  border-right: 1px solid
-    var(--color-primary-border, rgba(111, 50, 155, 0.14));
-  display: flex;
-  flex-direction: column;
-  overflow: hidden;
-  transition:
-    width 0.24s ease,
-    border-right-width 0.24s ease;
-  position: relative;
-}
-
-.sidebar.collapsed {
-  width: 0;
-  border-right: 0;
-  padding: 0;
-}
-
-.sidebar-inner {
-  width: 240px;
-  height: 100%;
-  display: flex;
-  flex-direction: column;
-  padding: 16px 12px 12px;
-  gap: 12px;
-  overflow: hidden;
-}
-
-.sidebar-section {
-  display: flex;
-  flex-direction: column;
-  min-height: 0;
-}
-
-.sidebar-section.sidebar-top {
-  flex-shrink: 0;
-}
-
-.new-session-btn {
-  width: 100%;
-  height: 44px;
-  border: 0;
-  border-radius: 12px;
-  background: var(--gradient-primary);
-  color: #fff;
-  font-size: 14px;
-  font-weight: 600;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  cursor: pointer;
-  font-family: inherit;
-  box-shadow: 0 4px 12px rgba(123, 63, 178, 0.22);
-  transition: transform 0.12s ease, box-shadow 0.18s ease;
-}
-
-.new-session-btn:hover {
-  transform: translateY(-1px);
-  box-shadow: 0 6px 16px rgba(123, 63, 178, 0.28);
-}
-
-.sidebar-link {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  width: 100%;
-  height: 38px;
-  margin-top: 8px;
-  padding: 0 12px;
-  border-radius: 10px;
-  color: var(--color-text-medium);
-  font-size: 13px;
-  font-weight: 500;
-  text-decoration: none;
-  transition: background 0.14s ease, color 0.14s ease;
-}
-
-.sidebar-link:hover {
-  background: var(--color-bg-hover);
-  color: var(--color-primary);
-}
-
-.sidebar-link.active {
-  background: var(--color-bg-active);
-  color: var(--color-primary);
-  font-weight: 600;
-}
-
-.sidebar-link-icon {
-  display: inline-flex;
-  align-items: center;
-  color: var(--color-text-light);
-}
-
-.sidebar-link:hover .sidebar-link-icon,
-.sidebar-link.active .sidebar-link-icon {
-  color: var(--color-primary);
-}
-
-.section-label {
-  padding: 10px 12px 6px;
-  font-size: 11px;
-  font-weight: 700;
-  letter-spacing: 0.6px;
-  color: var(--color-text-light, #627d98);
-  text-transform: uppercase;
-}
-
-.session-list {
-  display: flex;
-  flex-direction: column;
-  gap: 2px;
-  overflow-y: auto;
-  min-height: 0;
-  flex: 1;
-}
-
-.session-empty {
-  padding: 10px 12px;
-  font-size: 12px;
-  color: var(--color-text-light, #9fb3c8);
-  text-align: center;
-}
-
-.session-item-wrap {
-  position: relative;
-  display: flex;
-  align-items: stretch;
-}
-
-.session-item {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  padding: 8px 34px 8px 10px;
-  border: 0;
-  border-radius: 8px;
-  background: transparent;
-  color: var(--color-text-medium, #486581);
-  font-size: 13px;
-  font-weight: 500;
-  text-align: left;
-  cursor: pointer;
-  position: relative;
-  transition: background 0.12s, color 0.12s;
-  min-width: 0;
-  flex: 1;
-  font-family: inherit;
-}
-
-.session-title {
-  flex: 1;
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.session-item:hover {
-  background: var(--color-bg-hover, #f0ecf5);
-  color: var(--color-text-dark, #102a43);
-}
-
-.session-item.active {
-  background: var(--color-bg-active, #efeaf7);
-  color: var(--color-primary, #7b3fb2);
-  font-weight: 600;
-}
-
-.session-time {
-  flex-shrink: 0;
-  font-size: 10px;
-  color: var(--color-text-light, #9fb3c8);
-  font-weight: 500;
-}
-
-.session-item.active .session-time {
-  color: var(--color-primary);
-  opacity: 0.75;
-}
-
-.session-delete {
-  position: absolute;
-  right: 2px;
-  top: 50%;
-  transform: translateY(-50%);
-  width: 28px;
-  height: 28px;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  border: 0;
-  border-radius: 6px;
-  background: transparent;
-  color: var(--color-text-light, #9fb3c8);
-  cursor: pointer;
-  opacity: 0;
-  transition:
-    opacity 0.12s,
-    background 0.12s,
-    color 0.12s;
-}
-
-.session-item-wrap:hover .session-delete,
-.session-delete:focus-visible {
-  opacity: 1;
-}
-
-.session-delete:hover {
-  background: rgba(220, 53, 69, 0.08);
-  color: #dc3545;
-}
-
 /* ── sb-toggle 半胶囊：top:74px 严格 ai-report-dev ── */
-.sb-toggle {
-  position: absolute;
-  top: 74px;
-  z-index: 30;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  width: 16px;
-  height: 32px;
-  border: 1px solid
-    var(--color-primary-border, rgba(111, 50, 155, 0.14));
-  border-left: 0;
-  border-radius: 0 8px 8px 0;
-  background: #fff;
-  color: var(--color-text-medium, #627d98);
-  cursor: pointer;
-  transition:
-    left 0.24s ease,
-    background 0.15s,
-    color 0.15s,
-    border-color 0.15s;
-  padding: 0;
-  font-family: inherit;
-}
-
-.sb-toggle:hover {
-  background: var(--color-primary-light);
-  color: var(--color-primary);
-  border-color: var(--color-primary-border-strong);
-}
-
-.toggle-arrow {
-  transition: transform 0.24s ease;
-}
-
-.toggle-arrow.flip {
-  transform: rotate(180deg);
-}
-
 /* ── 主区域 ── */
-.main-area {
-  flex: 1;
-  min-width: 0;
-  min-height: 0;
-  overflow: auto;
-  padding: 24px 28px 36px;
-  background: var(--color-bg-app, #f7f5fb);
-}
-
-.main-area.no-pad {
-  padding: 0;
-  overflow: hidden;
-}
 </style>

@@ -23,15 +23,30 @@ class DataCatalog:
         restore: Callable[[str], RegisteredDataSource | None] | None = None,
     ) -> None:
         self._sources: dict[str, RegisteredDataSource] = {}
+        #: Who uploaded each dataset, for the HTTP surface to filter on. Kept
+        #: here rather than on the sources because it is not a property of the
+        #: data — a source class should not have to know about logins.
+        #:
+        #: In memory only, like the sources themselves: a dataset recovered by
+        #: ``_restore`` after a restart comes back ownerless and so is
+        #: unreachable over HTTP. The report that needs it reads through
+        #: ``get_source`` and is unaffected.
+        self._owners: dict[str, str | None] = {}
         #: Looks up a dataset the catalog has never seen, so an upload can
         #: outlive the process that registered it.
         self._restore = restore
 
-    def register(self, source: RegisteredDataSource) -> None:
+    def register(self, source: RegisteredDataSource, *, owner_id: str | None = None) -> None:
         for dataset in source.datasets:
             if dataset.dataset_id in self._sources:
                 raise ValueError(f"Dataset already registered: {dataset.dataset_id}")
             self._sources[dataset.dataset_id] = source
+            self._owners[dataset.dataset_id] = owner_id
+
+    def owner_of(self, dataset_id: str) -> str | None:
+        """Who uploaded this dataset, or None if it predates the catalog's
+        knowledge of it (a restored upload, or a pre-login registration)."""
+        return self._owners.get(dataset_id)
 
     def get_source(self, dataset_id: str) -> RegisteredDataSource:
         source = self._sources.get(dataset_id)
@@ -44,8 +59,20 @@ class DataCatalog:
             raise KeyError(f"Dataset not found: {dataset_id}")
         return source
 
-    async def list_datasets(self) -> list[DatasetInfo]:
-        return [dataset for source in self._sources.values() for dataset in source.datasets]
+    async def list_datasets(self, owner_id: str | None = None) -> list[DatasetInfo]:
+        """Every registered dataset, or only one user's.
+
+        The default is unfiltered: the report tools read through here and run
+        on behalf of a session that has already been authorised. Only the HTTP
+        surface passes an owner.
+        """
+        return [
+            dataset
+            for dataset_id, source in self._sources.items()
+            for dataset in source.datasets
+            if dataset.dataset_id == dataset_id
+            and (owner_id is None or self._owners.get(dataset_id) == owner_id)
+        ]
 
     async def schema(self, dataset_id: str, sheet_name: str | None = None):
         return await self.get_source(dataset_id).get_schema(dataset_id, sheet_name)

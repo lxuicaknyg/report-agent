@@ -22,6 +22,7 @@ from ..core.reports import (
     ReportGenerationSession,
     ReportGenerationStatus,
     ResolveQuestionsRequest,
+    UserInputRejected,
 )
 from ..infrastructure.logging import preview
 from ..reporting.report_generation import ReportGenerationService
@@ -75,6 +76,14 @@ class ConversationOrchestrator:
     async def list_conversations(self, user_id: str | None = None) -> list[Conversation]:
         items = await self.conversations.list(user_id)
         return sorted(items, key=lambda item: item.updated_at, reverse=True)
+
+    async def get_conversation(self, conversation_id: str) -> Conversation:
+        """The thread itself, without its messages or report.
+
+        Exists so a route can check who owns a conversation before doing the
+        work of loading one.
+        """
+        return await self.conversations.get(conversation_id)
 
     async def get_detail(self, conversation_id: str) -> ConversationDetail:
         conversation = await self.conversations.get(conversation_id)
@@ -134,14 +143,19 @@ class ConversationOrchestrator:
         payload: dict[str, Any] = {"resolutions": resolutions} if resolutions else {}
         if template_content and template_filename:
             template = await self.reports.upload_template(
-                template_filename, template_content, template_content_type
+                template_filename,
+                template_content,
+                template_content_type,
+                owner_id=conversation.user_id,
             )
             payload["template_id"] = template.template_id
             attachments.append(
                 MessageAttachment(filename=template_filename, kind="template", size=len(template_content))
             )
         if data_content and data_filename:
-            dataset_id = await self.reports.register_excel_dataset(data_filename, data_content)
+            dataset_id = await self.reports.register_excel_dataset(
+                data_filename, data_content, owner_id=conversation.user_id
+            )
             payload["dataset_ids"] = [dataset_id]
             attachments.append(
                 MessageAttachment(filename=data_filename, kind="data", size=len(data_content))
@@ -193,9 +207,24 @@ class ConversationOrchestrator:
 
     def _error_text(self, exc: Exception) -> str:
         """User-facing failure text. The full traceback stays in the log."""
+        if isinstance(exc, UserInputRejected):
+            # The message already says what to do; there is nothing in the log
+            # that would help, and sending the user there only reads as a fault.
+            return str(exc)
         name = type(exc).__name__
         if "Connection" in name or "Timeout" in name:
             return "模型服务连接失败。说「重试」可以从中断的地方接着写。"
+        # 网关的鉴权失败是部署配置问题，而原文（例如 ModelArts.8902
+        # "Api key auth failed"）读起来像模型本身出了错，会把人引去查模型和额度。
+        # 重试也没有意义 —— 凭据不会自己变对。
+        lowered = str(exc).lower()
+        if ("api key" in lowered or "api_key" in lowered or "apikey" in lowered) and (
+            "invalid" in lowered or "empty" in lowered or "auth" in lowered
+        ):
+            return (
+                "模型网关拒绝了凭据：请检查部署配置里的 LLM_API_KEY。"
+                "网关要求鉴权时它不能留空，改完要重启后端容器。"
+            )
         detail = self._failure_text(str(exc)) if str(exc).strip() else f"处理失败：{name}"
         return f"{detail}（详细原因见后端日志）"
 
@@ -208,13 +237,24 @@ class ConversationOrchestrator:
         user_message: Message,
         history: list[Message],
     ) -> MessageIntent:
-        has_inputs = bool(user_message.payload.get("template_id")) and bool(
-            user_message.payload.get("dataset_ids")
-        )
+        # A template is enough to start: it says which chapters exist, and a
+        # report with no data file asks the user for every figure instead of
+        # reading them.
+        has_inputs = bool(user_message.payload.get("template_id"))
         if has_inputs:
             return MessageIntent.CREATE
         if session is None:
-            return MessageIntent.CHAT
+            # No template. A data file, a sentence, or both may still be a
+            # brief — with a spreadsheet the model proposes a structure the
+            # columns can actually answer. Saying hello or asking a question is
+            # not, so the model decides. With no model there is nothing to plan
+            # a structure with either, so the answer is to ask for an upload.
+            if self.llm is None:
+                return MessageIntent.CHAT
+            resolved = await self._classify_with_model(
+                None, user_message, history, ["create", "chat"]
+            )
+            return resolved or MessageIntent.CHAT
 
         awaiting_plan = session.plan is not None and session.plan.status == "awaiting_confirmation"
         awaiting_answer = (
@@ -259,18 +299,18 @@ class ConversationOrchestrator:
 
     async def _classify_with_model(
         self,
-        session: ReportGenerationSession,
+        session: ReportGenerationSession | None,
         user_message: Message,
         history: list[Message],
         candidates: list[str],
     ) -> MessageIntent | None:
         context = {
             "candidates": candidates,
-            "report_status": session.status.value,
-            "current_plan": session.plan.model_dump(mode="json") if session.plan else None,
+            "report_status": session.status.value if session else None,
+            "current_plan": session.plan.model_dump(mode="json") if session and session.plan else None,
             "pending_questions": [
                 {"question_id": item.question_id, "content": item.content}
-                for item in session.pending_questions
+                for item in (session.pending_questions if session else [])
             ],
             "recent_messages": [
                 {"role": item.role, "content": item.content} for item in history[-6:]
@@ -290,7 +330,11 @@ class ConversationOrchestrator:
             if value in candidates:
                 return MessageIntent(value)
         except Exception:
-            logger.warning("intent_classification_failed session_id=%s", session.session_id, exc_info=True)
+            logger.warning(
+                "intent_classification_failed session_id=%s",
+                session.session_id if session else "-",
+                exc_info=True,
+            )
         return None
 
     @staticmethod
@@ -378,7 +422,7 @@ class ConversationOrchestrator:
         if isinstance(raw, list) and raw:
             return [QuestionResolutionInput.model_validate(item) for item in raw]
         if len(session.pending_questions) != 1:
-            raise ValueError(
+            raise UserInputRejected(
                 f"本章还有 {len(session.pending_questions)} 项待处理，请在上方卡片中逐项确认后提交"
             )
         return [
@@ -407,8 +451,12 @@ class ConversationOrchestrator:
         # a conversation that does not know its report cannot retry one.
         session = await self.reports.create_session(
             CreateReportGenerationRequest(
-                template_id=str(user_message.payload["template_id"]),
-                dataset_ids=[str(item) for item in user_message.payload["dataset_ids"]],
+                # Absent when the report's structure is coming from the
+                # conversation rather than an uploaded document.
+                template_id=str(user_message.payload.get("template_id") or "") or None,
+                # Absent when the user uploaded only a template: the report is
+                # then written from figures they supply rather than read.
+                dataset_ids=[str(item) for item in user_message.payload.get("dataset_ids") or []],
                 instruction=user_message.content,
             ),
             user_id=conversation.user_id,
@@ -663,7 +711,10 @@ class ConversationOrchestrator:
 
     @staticmethod
     def _missing_inputs_hint() -> str:
-        return "请通过「+」上传一个报告模板（docx/md/txt）和一个 Excel 数据文件，并说明你要生成什么报告。"
+        return (
+            "请通过「+」上传一个报告模板（docx/md/txt），并说明你要生成什么报告。"
+            "同时上传 Excel 数据文件我就直接取数；没有数据文件也可以，我会逐项问你要。"
+        )
 
     def _state_hint(self, session: ReportGenerationSession | None) -> str:
         if session is None:

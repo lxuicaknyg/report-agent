@@ -68,7 +68,3 @@ class ConversationDetail(BaseModel):
 
 class CreateConversationRequest(BaseModel):
     title: str | None = None
-
-
-class PostMessageRequest(BaseModel):
-    text: str = Field(min_length=1)

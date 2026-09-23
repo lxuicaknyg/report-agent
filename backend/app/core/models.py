@@ -89,6 +89,26 @@ class AggregateResult(BaseModel):
     #: Rows the filters matched before grouping — the denominator a reader
     #: needs to tell "no matching data" from "everything summed to zero".
     matched_rows: int = 0
+    #: 1-based worksheet line numbers behind each result row, in the same
+    #: order as ``rows`` — what a reader opens the workbook and looks at to
+    #: check a figure. Capped per row; ``source_rows_truncated`` says when a
+    #: list was cut.
+    source_rows: list[list[int]] = Field(default_factory=list)
+    source_rows_truncated: bool = False
+    #: The columns a reader should look at on those lines.
+    source_columns: list[str] = Field(default_factory=list)
+    #: Groups the aggregation produced before ``limit`` was applied. Equal to
+    #: ``row_count`` unless the result was cut.
+    total_groups: int = 0
+    #: True when ``limit`` dropped groups. A caller that does not know this
+    #: reads a partial breakdown as the whole of one, which is how a report
+    #: ends up summing 100 branches and calling it the bank.
+    groups_truncated: bool = False
+    #: Anything that had to be assumed or repaired to produce these figures —
+    #: a text column coerced to numbers, cells that would not convert. Carried
+    #: on the result rather than logged, because whoever reads the number is
+    #: who needs to know it was not a clean read.
+    warnings: list[str] = Field(default_factory=list)
 
 
 class DataReadRequest(BaseModel):

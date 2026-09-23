@@ -7,6 +7,8 @@ from pathlib import Path
 
 from openpyxl import Workbook
 
+from app.connections.service import ConnectionService
+from app.core.connections import ConnectionQueryResult
 from app.core.ports import LlmService
 from app.core.reports import (
     QuestionResolutionInput,
@@ -113,7 +115,11 @@ class RecordingWriter(ChapterWriter):
         )
 
 
-def build_service(writer: ChapterWriter | None = None, llm: LlmService | None = None):
+def build_service(
+    writer: ChapterWriter | None = None,
+    llm: LlmService | None = None,
+    connections=None,
+):
     return ReportGenerationService(
         sessions=InMemoryReportSessionRepository(),
         templates=InMemoryReportTemplateRepository(),
@@ -124,6 +130,7 @@ def build_service(writer: ChapterWriter | None = None, llm: LlmService | None = 
         renderer=MarkdownReportRenderer(),
         artifact_store=InMemoryArtifactStore(),
         catalog=DataCatalog(),
+        connections=connections,
     )
 
 
@@ -420,7 +427,7 @@ class TwoQuestionWriter(ChapterWriter):
                 status="waiting_user",
                 questions=[
                     UserQuestion(question_id="q_yoy", metric="同比增速", expected="value", content="缺同期数据"),
-                    UserQuestion(question_id="q_branch", metric="分行明细", expected="dataset", content="缺分行字段"),
+                    UserQuestion(question_id="q_branch", metric="分行明细", expected="table", content="缺分行字段"),
                 ],
             )
         return ChapterWriterResult(
@@ -512,7 +519,155 @@ def test_a_dropped_metric_leaves_the_plan_and_reaches_the_writer_as_dropped():
     asyncio.run(run())
 
 
-def test_sql_supplements_are_refused_until_the_data_source_page_exists():
+class StubConnections:
+    """Stands in for the connection service: records what it was asked to run
+    and hands back a canned result."""
+
+    def __init__(self, result: ConnectionQueryResult):
+        self.result = result
+        self.calls: list[tuple[str, str]] = []
+        self.shapes: list[str] = []
+
+    async def query(self, connection_id: str, sql: str, shape: str = "value") -> ConnectionQueryResult:
+        self.calls.append((connection_id, sql))
+        self.shapes.append(shape)
+        if connection_id == "missing":
+            raise KeyError(connection_id)
+        return self.result
+
+
+def query_result(columns, rows, truncated=False):
+    return ConnectionQueryResult(
+        success=True,
+        connection_name="本地 MySQL（零售测试库）",
+        columns=columns,
+        rows=rows,
+        row_count=len(rows),
+        truncated=truncated,
+        extraction=ConnectionService.extract(columns, rows, truncated),
+    )
+
+
+def test_a_sql_supplement_records_the_value_its_query_returned():
+    """The number is read out of the database, not taken from the request, and
+    the dimensions the query selected travel with it."""
+
+    async def run():
+        writer = TwoQuestionWriter("section_2")
+        connections = StubConnections(
+            query_result(
+                ["统计日期", "存款余额"],
+                [{"统计日期": "2024-04-15", "存款余额": 2049900.25}],
+            )
+        )
+        service = build_service(writer, connections=connections)
+        session = await build_waiting_session(service, writer, "excel_res_3")
+        session = await service.resolve_questions(
+            session.session_id,
+            ResolveQuestionsRequest(
+                resolutions=[
+                    QuestionResolutionInput(
+                        question_id="q_yoy",
+                        action="sql",
+                        connection_id="conn_1",
+                        query="SELECT Statistics_Dt, SUM(Deposit_Bal) FROM t GROUP BY 1",
+                    ),
+                    QuestionResolutionInput(question_id="q_branch", action="drop"),
+                ],
+                auto_resume=False,
+            ),
+        )
+        settled = next(
+            item for item in session.resolved_questions if item.question_id == "q_yoy"
+        )
+        assert settled.resolution == "sql"
+        assert settled.value == "2049900.25"
+        assert settled.dimensions == {"统计日期": "2024-04-15"}
+        assert settled.connection_id == "conn_1"
+        assert connections.calls == [
+            ("conn_1", "SELECT Statistics_Dt, SUM(Deposit_Bal) FROM t GROUP BY 1")
+        ]
+
+    asyncio.run(run())
+
+
+def test_a_sql_supplement_reaches_the_chapter_writer_with_its_provenance():
+    async def run():
+        writer = TwoQuestionWriter("section_2")
+        connections = StubConnections(
+            query_result(["统计日期", "余额"], [{"统计日期": "2024-04-15", "余额": 2049900.25}])
+        )
+        service = build_service(writer, connections=connections)
+        session = await build_waiting_session(service, writer, "excel_res_3")
+        await service.resolve_questions(
+            session.session_id,
+            ResolveQuestionsRequest(
+                resolutions=[
+                    QuestionResolutionInput(
+                        question_id="q_yoy", action="sql",
+                        connection_id="conn_1", query="SELECT 1",
+                    ),
+                    QuestionResolutionInput(question_id="q_branch", action="drop"),
+                ]
+            ),
+        )
+        # The run continues into later chapters, so take the rewrite of the
+        # chapter that asked rather than whatever ran last.
+        supplements = next(
+            item.supplements
+            for item in reversed(writer.inputs)
+            if item.section.section_id == "section_2"
+        )
+        assert [item.metric for item in supplements] == ["同比增速"]
+        assert supplements[0].value == "2049900.25"
+        assert supplements[0].dimensions == {"统计日期": "2024-04-15"}
+        assert supplements[0].query == "SELECT 1"
+        assert supplements[0].connection_id == "conn_1"
+        # The name is snapshotted, so provenance still reads correctly after
+        # the connection is renamed or deleted.
+        assert supplements[0].connection_name == "本地 MySQL（零售测试库）"
+
+    asyncio.run(run())
+
+
+def test_a_sql_supplement_that_returns_nothing_usable_is_refused():
+    """Several rows cannot settle one metric, and taking the first would answer
+    a different question than the one that was asked."""
+
+    async def run():
+        writer = TwoQuestionWriter("section_2")
+        connections = StubConnections(
+            query_result(
+                ["机构", "余额"],
+                [{"机构": "BR001", "余额": 1}, {"机构": "BR002", "余额": 2}],
+            )
+        )
+        service = build_service(writer, connections=connections)
+        session = await build_waiting_session(service, writer, "excel_res_3")
+        try:
+            await service.resolve_questions(
+                session.session_id,
+                ResolveQuestionsRequest(
+                    resolutions=[
+                        QuestionResolutionInput(
+                            question_id="q_yoy", action="sql",
+                            connection_id="conn_1", query="SELECT 1",
+                        )
+                    ]
+                ),
+            )
+        except ValueError as exc:
+            assert "收敛到一行" in str(exc)
+        else:
+            raise AssertionError("多行结果应被拒绝")
+        # The question stays pending, so the user can fix the query and retry.
+        reloaded = await service.get_session(session.session_id)
+        assert {item.question_id for item in reloaded.pending_questions} == {"q_yoy", "q_branch"}
+
+    asyncio.run(run())
+
+
+def test_a_sql_supplement_without_a_connection_service_is_refused():
     async def run():
         writer = TwoQuestionWriter("section_2")
         service = build_service(writer)
@@ -523,27 +678,95 @@ def test_sql_supplements_are_refused_until_the_data_source_page_exists():
                 ResolveQuestionsRequest(
                     resolutions=[
                         QuestionResolutionInput(
-                            question_id="q_branch", action="sql", dataset_id="sql_x", query="select 1"
+                            question_id="q_branch", action="sql",
+                            connection_id="conn_1", query="select 1",
                         )
                     ]
                 ),
             )
         except ValueError as exc:
-            assert "尚未开放" in str(exc)
+            assert "未启用数据源连接" in str(exc)
         else:
-            raise AssertionError("SQL 补充当前应被拒绝")
+            raise AssertionError("没有连接服务时 SQL 补充应被拒绝")
 
     asyncio.run(run())
 
 
 def test_a_chapter_past_its_ask_limit_drops_the_metric_instead_of_killing_the_report():
-    """The user answered every round it was allowed to ask. Killing the whole
-    report at that point throws away the chapters that did work."""
+    """The user settled every round it was allowed to ask and it still wants
+    more. Killing the whole report at that point throws away the chapters that
+    did work."""
 
     async def run():
-        class AsksUntilDropped(ChapterWriter):
+        class AsksANewMetricEachRound(ChapterWriter):
+            """Never satisfied: every round it wants a different number, so the
+            user settles one question only to be handed another."""
+
+            def __init__(self) -> None:
+                self.asked = 0
+
             async def write(self, input, session, checkpoint=None) -> ChapterWriterResult:
-                if input.section.section_id == "section_2" and "X" not in input.dropped_metrics:
+                if input.section.section_id == "section_2" and not input.dropped_metrics:
+                    self.asked += 1
+                    return ChapterWriterResult(
+                        status="waiting_user",
+                        questions=[
+                            UserQuestion(
+                                question_id=f"q{self.asked}",
+                                metric=f"M{self.asked}",
+                                content="还是缺",
+                            )
+                        ],
+                    )
+                return ChapterWriterResult(
+                    status="completed",
+                    draft=ChapterDraft(
+                        chapter_id=input.section.section_id,
+                        section_id=input.section.section_id,
+                        title=input.section.title,
+                        content="正文",
+                    ),
+                )
+
+        writer = AsksANewMetricEachRound()
+        service = build_service(writer)
+        service.max_chapter_attempts = 2
+        session = await build_waiting_session(service, None, "excel_res_4")
+
+        for index in range(1, 3):
+            if session.status != ReportGenerationStatus.WAITING_USER:
+                break
+            session = await service.resolve_questions(
+                session.session_id,
+                ResolveQuestionsRequest(
+                    resolutions=[
+                        QuestionResolutionInput(question_id=f"q{index}", action="value", value="1")
+                    ]
+                ),
+            )
+
+        assert session.status == ReportGenerationStatus.COMPLETED
+        assert "section_2" in session.chapter_drafts
+        # Only the metric still being asked for is given up on; the two the user
+        # answered are untouched.
+        assert session.dropped_metrics["section_2"] == ["M3"]
+        given_up = [
+            item for item in session.resolved_questions
+            if item.resolution == "dropped" and item.note and "已自动移出报告" in item.note
+        ]
+        assert [item.metric for item in given_up] == ["M3"]
+
+    asyncio.run(run())
+
+
+def test_a_metric_the_user_supplied_is_never_given_up_on():
+    """Dropping it would throw away a number the user typed in themselves,
+    which is worse than the loop the ask limit exists to break."""
+
+    async def run():
+        class AsksForTheSameMetricForever(ChapterWriter):
+            async def write(self, input, session, checkpoint=None) -> ChapterWriterResult:
+                if input.section.section_id == "section_2":
                     return ChapterWriterResult(
                         status="waiting_user",
                         questions=[UserQuestion(question_id="q_loop", metric="X", content="还是缺")],
@@ -558,31 +781,32 @@ def test_a_chapter_past_its_ask_limit_drops_the_metric_instead_of_killing_the_re
                     ),
                 )
 
-        service = build_service(AsksUntilDropped())
+        service = build_service(AsksForTheSameMetricForever())
         service.max_chapter_attempts = 2
-        session = await build_waiting_session(service, None, "excel_res_4")
+        session = await build_waiting_session(service, None, "excel_res_6")
 
-        for _ in range(2):
+        for _ in range(3):
             if session.status != ReportGenerationStatus.WAITING_USER:
                 break
             session = await service.resolve_questions(
                 session.session_id,
                 ResolveQuestionsRequest(
                     resolutions=[
-                        QuestionResolutionInput(question_id="q_loop", action="value", value="1")
+                        QuestionResolutionInput(
+                            question_id="q_loop", action="value", value="1.24 亿元"
+                        )
                     ]
                 ),
             )
 
-        assert session.status == ReportGenerationStatus.COMPLETED
-        assert "section_2" in session.chapter_drafts
-        assert session.dropped_metrics["section_2"] == ["X"]
-        # The give-up is on the record, which is how the user gets told.
-        given_up = [
+        # It parks asking rather than discarding the answer.
+        assert session.status == ReportGenerationStatus.WAITING_USER
+        assert "X" not in session.dropped_metrics.get("section_2", [])
+        supplied = [
             item for item in session.resolved_questions
-            if item.resolution == "dropped" and item.note and "已自动移出报告" in item.note
+            if item.metric == "X" and item.resolution == "value"
         ]
-        assert [item.metric for item in given_up] == ["X"]
+        assert supplied and supplied[-1].value == "1.24 亿元"
 
     asyncio.run(run())
 
@@ -726,3 +950,86 @@ def test_numeric_ranges_are_ordered_as_numbers():
     assert ReportGenerationService._ordered({1000000, 997000, 2855600})[-1] == 2855600
     # Mixed types must still produce a stable order rather than raising.
     assert ReportGenerationService._ordered({"b", 1, "a"})
+
+
+def table_result(columns, rows, truncated=False):
+    return ConnectionQueryResult(
+        success=True,
+        connection_name="本地 MySQL（零售测试库）",
+        columns=columns,
+        rows=rows,
+        row_count=len(rows),
+        truncated=truncated,
+        extraction=ConnectionService.extract(columns, rows, truncated, "table"),
+    )
+
+
+def test_a_detail_table_supplement_reaches_the_chapter_as_rows():
+    """A list metric is answered with rows, not with a figure — and the kind
+    the question was raised with is what the backend runs the query as."""
+
+    async def run():
+        writer = TwoQuestionWriter("section_2")
+        connections = StubConnections(
+            table_result(
+                ["项目编号", "客户名称", "投放金额"],
+                [{"项目编号": "P01", "客户名称": "甲公司", "投放金额": 1200},
+                 {"项目编号": "P02", "客户名称": "乙公司", "投放金额": 800}],
+            )
+        )
+        service = build_service(writer, connections=connections)
+        session = await build_waiting_session(service, writer, "excel_res_3")
+        await service.resolve_questions(
+            session.session_id,
+            ResolveQuestionsRequest(
+                resolutions=[
+                    QuestionResolutionInput(
+                        question_id="q_branch", action="sql",
+                        connection_id="conn_1", query="SELECT 1",
+                    ),
+                    QuestionResolutionInput(question_id="q_yoy", action="drop"),
+                ]
+            ),
+        )
+        supplements = next(
+            item.supplements
+            for item in reversed(writer.inputs)
+            if item.section.section_id == "section_2"
+        )
+        assert [item.metric for item in supplements] == ["分行明细"]
+        item = supplements[0]
+        assert item.source == "sql"
+        assert item.value is None
+        assert item.columns == ["项目编号", "客户名称", "投放金额"]
+        assert len(item.rows) == 2 and item.rows[0]["客户名称"] == "甲公司"
+        # The question said this metric is a list, so that is how the query is
+        # read — the user was never asked to say it a second time, and the
+        # shape is not re-derived from the row count either.
+        assert connections.shapes == ["table"]
+
+    asyncio.run(run())
+
+
+def test_a_typed_in_answer_is_labelled_manual_not_sql():
+    async def run():
+        writer = TwoQuestionWriter("section_2")
+        service = build_service(writer)
+        session = await build_waiting_session(service, writer, "excel_res_3")
+        await service.resolve_questions(
+            session.session_id,
+            ResolveQuestionsRequest(
+                resolutions=[
+                    QuestionResolutionInput(question_id="q_yoy", action="value", value="1.24 亿元"),
+                    QuestionResolutionInput(question_id="q_branch", action="drop"),
+                ]
+            ),
+        )
+        supplements = next(
+            item.supplements
+            for item in reversed(writer.inputs)
+            if item.section.section_id == "section_2"
+        )
+        assert supplements[0].source == "manual"
+        assert supplements[0].query is None
+
+    asyncio.run(run())

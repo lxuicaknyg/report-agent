@@ -2,7 +2,10 @@ import { defineStore } from 'pinia'
 import { computed, ref } from 'vue'
 import { connectionApi } from '../services/api/connections'
 import type {
+  AnalysisSqlResult,
+  AnalysisType,
   ConnectionInput,
+  ConnectionQueryResult,
   ConnectionTestResult,
   DataConnection,
   DriverSpec,
@@ -106,6 +109,57 @@ export const useConnectionStore = defineStore('connection', () => {
     }
   }
 
+  /**
+   * Trial-run a statement so the user can see what it would supply.
+   *
+   * Rejected SQL is a result, not a failure: it comes back on the payload with
+   * `success: false` and is rendered beside the editor. Only a transport-level
+   * problem goes through `error`, and it is returned rather than stored — two
+   * question cards can be running their own queries at once, and one card's
+   * failure must not paint the other.
+   */
+  async function query(
+    connectionId: string,
+    sql: string,
+    shape: 'value' | 'table' = 'value',
+  ): Promise<ConnectionQueryResult> {
+    const result = await connectionApi.query(connectionId, sql, shape)
+    if (result.success && result.data) return result.data
+    return {
+      success: false,
+      message: result.error?.message || '取数失败',
+      connection_name: '',
+      columns: [],
+      rows: [],
+      row_count: 0,
+      truncated: false,
+      elapsed_ms: 0,
+      extraction: null,
+    }
+  }
+
+  /**
+   * Ask for a derived-analysis rewrite of a query.
+   *
+   * Like `query`, a refusal comes back on the payload rather than through the
+   * shared `error`: two cards can be generating at once and one card's failure
+   * must not paint the other.
+   */
+  async function analysisSql(
+    connectionId: string,
+    sql: string,
+    analysisType: AnalysisType,
+  ): Promise<AnalysisSqlResult> {
+    const result = await connectionApi.analysisSql(connectionId, sql, analysisType)
+    if (result.success && result.data) return result.data
+    return {
+      success: false,
+      message: result.error?.message || '生成失败',
+      dialect: '',
+      generated_sql: null,
+    }
+  }
+
   function clearError() {
     error.value = null
   }
@@ -125,6 +179,8 @@ export const useConnectionStore = defineStore('connection', () => {
     update,
     remove,
     test,
+    query,
+    analysisSql,
     clearError,
   }
 })

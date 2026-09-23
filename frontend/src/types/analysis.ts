@@ -1,6 +1,6 @@
 import type { DatasetProfile } from './dataset'
 
-export type EvidenceKind = 'dataset' | 'query' | 'research' | 'calculation'
+export type EvidenceKind = 'dataset' | 'query' | 'research' | 'calculation' | 'generated_sql'
 
 export interface Evidence {
   evidence_id: string

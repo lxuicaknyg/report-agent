@@ -26,6 +26,8 @@ from app.reporting.report_generation import ReportGenerationService
 from app.reporting.template_parser import ReportTemplateParser
 from app.api.routes import reports as reports_route
 
+from conftest import API, sign_in
+
 TEMPLATE_BYTES = "# 经营分析报告\n\n## 一、经营概况\n概况正文\n\n## 二、风险情况\n风险正文".encode()
 
 
@@ -56,7 +58,9 @@ def client(monkeypatch):
     )
     monkeypatch.setattr(conversations_route, "get_conversation_orchestrator", lambda: orchestrator)
     monkeypatch.setattr(reports_route, "get_report_generation_service", lambda: reports)
-    with TestClient(create_app()) as test_client:
+    app = create_app()
+    sign_in(app)
+    with TestClient(app) as test_client:
         yield test_client
 
 
@@ -75,8 +79,8 @@ def kinds(detail) -> list[str]:
 
 
 def test_report_is_created_revised_and_downloaded_through_messages(client):
-    conversation = client.post("/api/v1/conversations", json={"title": None}).json()
-    url = f"/api/v1/conversations/{conversation['conversation_id']}"
+    conversation = client.post(f"{API}/conversations", json={"title": None}).json()
+    url = f"{API}/conversations/{conversation['conversation_id']}"
 
     accepted = client.post(
         f"{url}/messages",
@@ -103,22 +107,22 @@ def test_report_is_created_revised_and_downloaded_through_messages(client):
     report_message = next(item for item in detail["messages"] if item["kind"] == "report")
     artifact_id = report_message["payload"]["artifacts"][0]["artifact_id"]
 
-    download = client.get(f"/api/v1/reports/{session_id}/artifacts/{artifact_id}")
+    download = client.get(f"{API}/reports/{session_id}/artifacts/{artifact_id}")
     assert download.status_code == 200
     assert "经营分析报告" in download.content.decode("utf-8")
 
 
 def test_report_write_endpoints_are_gone(client):
     # POST /reports keeps the path (GET still lists) but no longer accepts writes.
-    assert client.post("/api/v1/reports", json={"instruction": "x"}).status_code == 405
-    for path in ("/api/v1/reports/any/plan/confirm", "/api/v1/reports/any/answers", "/api/v1/reports/any/resume"):
+    assert client.post(f"{API}/reports", json={"instruction": "x"}).status_code == 405
+    for path in (f"{API}/reports/any/plan/confirm", f"{API}/reports/any/answers", f"{API}/reports/any/resume"):
         assert client.post(path, json={}).status_code == 404
 
 
 def test_empty_message_is_rejected(client):
-    conversation = client.post("/api/v1/conversations", json={"title": None}).json()
+    conversation = client.post(f"{API}/conversations", json={"title": None}).json()
     response = client.post(
-        f"/api/v1/conversations/{conversation['conversation_id']}/messages",
+        f"{API}/conversations/{conversation['conversation_id']}/messages",
         json={"text": "   "},
     )
     assert response.status_code == 400
@@ -133,8 +137,8 @@ def test_question_resolutions_travel_as_a_message(client, monkeypatch):
         captured["actions"] = [(r.question_id, r.action, r.value) for r in request.resolutions]
         raise RuntimeError("stop before regeneration")
 
-    conversation = client.post("/api/v1/conversations", json={"title": None}).json()
-    url = f"/api/v1/conversations/{conversation['conversation_id']}"
+    conversation = client.post(f"{API}/conversations", json={"title": None}).json()
+    url = f"{API}/conversations/{conversation['conversation_id']}"
     response = client.post(
         f"{url}/messages",
         json={

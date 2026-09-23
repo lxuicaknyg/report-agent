@@ -1,4 +1,4 @@
-import { apiClient } from './client'
+import { hostApi } from './client'
 import type { ApiResult, ReportTemplate, ReportGenerationSession } from '../../types'
 
 export interface PaginatedTemplatesResponse {
@@ -20,27 +20,27 @@ export interface PaginatedSessionsResponse {
 export const reportApi = {
   listTemplates(offset = 0, limit = 50): Promise<ApiResult<PaginatedTemplatesResponse>> {
     const q = new URLSearchParams({ offset: String(offset), limit: String(limit) })
-    return apiClient.get<PaginatedTemplatesResponse>(`/reports/templates?${q.toString()}`)
+    return hostApi.get<PaginatedTemplatesResponse>(`/reports/templates?${q.toString()}`)
   },
 
   uploadTemplate(file: File): Promise<ApiResult<ReportTemplate>> {
-    return apiClient.upload<ReportTemplate>('/reports/templates', file)
+    return hostApi.upload<ReportTemplate>('/reports/templates', file)
   },
 
   getTemplate(templateId: string): Promise<ApiResult<ReportTemplate>> {
-    return apiClient.get<ReportTemplate>(`/reports/templates/${templateId}`)
+    return hostApi.get<ReportTemplate>(`/reports/templates/${templateId}`)
   },
 
   listSessions(offset = 0, limit = 20): Promise<ApiResult<PaginatedSessionsResponse>> {
     const q = new URLSearchParams({ offset: String(offset), limit: String(limit) })
-    return apiClient.get<PaginatedSessionsResponse>(`/reports?${q.toString()}`)
+    return hostApi.get<PaginatedSessionsResponse>(`/reports?${q.toString()}`)
   },
 
   getSession(sessionId: string): Promise<ApiResult<ReportGenerationSession>> {
-    return apiClient.get<ReportGenerationSession>(`/reports/${sessionId}`)
+    return hostApi.get<ReportGenerationSession>(`/reports/${sessionId}`)
   },
 
   downloadArtifact(sessionId: string, artifactId: string): Promise<ApiResult<Blob>> {
-    return apiClient.download(`/reports/${sessionId}/artifacts/${artifactId}`)
+    return hostApi.download(`/reports/${sessionId}/artifacts/${artifactId}`)
   },
 }

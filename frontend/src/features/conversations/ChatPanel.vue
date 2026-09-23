@@ -66,14 +66,18 @@ const liveProgress = computed(() => {
   const waiting = new Set(
     (session?.pending_questions ?? []).map((question) => question.chapter_id).filter(Boolean),
   )
+  // 停下来的跑不再有「正在写的那一章」。后端刻意保留 current_chapter_id 用于续跑，
+  // 所以这里必须看会话状态，否则停止后那一章会一直转着「正在生成中」。
+  const halted = session?.status === 'cancelled' || session?.status === 'failed'
   return planned.map((chapter) => {
     const draft = drafts[chapter.section_id]
+    const atChapter = session?.current_chapter_id === chapter.section_id
     const status = draft
       ? 'completed'
       : waiting.has(chapter.section_id)
         ? 'waiting_user'
-        : session?.current_chapter_id === chapter.section_id
-          ? 'running'
+        : atChapter
+          ? (halted ? 'stopped' : 'running')
           : 'pending'
     return {
       section_id: chapter.section_id,
@@ -450,7 +454,10 @@ watch(
 
 watch(
   () => store.currentConversationId,
-  () => {
+  (id, previous) => {
+    // A draft turning into a real thread is this same composer mid-send, not a
+    // switch — clearing here would throw away the text if that send then fails.
+    if (!previous && id) return
     inputValue.value = ''
     attachments.value = []
     nextTick(() => inputRef.value?.focus())
@@ -516,6 +523,7 @@ watch(
                   v-else-if="message.kind === 'progress' && isLatestProgress(message, index)"
                   :message="message"
                   :live="liveProgress"
+                  :drafts="store.reportSession?.chapter_drafts ?? null"
                   :session-status="store.reportSession?.status"
                 />
                 <QuestionCard
@@ -640,8 +648,6 @@ watch(
         </button>
       </div>
     </div>
-
-    <p class="disclaimer">请勿上传或处理敏感、涉密数据。本平台内容由 AI 生成，仅供参考。</p>
   </div>
 </template>
 
@@ -719,6 +725,26 @@ watch(
 
 .msg-row.is-assistant {
   justify-content: flex-start;
+}
+
+/* The assistant column is a fixed width, not a shrink-to-fit one.
+ *
+ * Left to the flex default (`flex: 0 1 auto`) this box is as wide as whatever
+ * it happens to hold, so a question card jumped between widths as the user
+ * moved through it — narrow with three buttons on screen, stretched once the
+ * SQL editor showed a wide result table, narrow again once submitted. Every
+ * card in here is a panel, and a panel that resizes while being filled in
+ * reads as a glitch. */
+.assistant-stack {
+  flex: 1 1 auto;
+  width: 100%;
+  /* Without this a wide child (a preview table with nowrap cells) can still
+     push the column past the conversation's width instead of scrolling
+     inside its own box. */
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
 }
 
 .bubble {

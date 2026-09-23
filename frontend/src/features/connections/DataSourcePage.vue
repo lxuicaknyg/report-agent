@@ -17,7 +17,6 @@ const form = reactive({
   database: '',
   username: '',
   password: '',
-  description: '',
   options: {} as Record<string, string>,
 })
 /** True once the user types in the password box of an edit form. */
@@ -54,7 +53,6 @@ function openCreate() {
     database: '',
     username: '',
     password: '',
-    description: '',
     options: {},
   })
   onDriverChange()
@@ -74,7 +72,6 @@ function openEdit(item: DataConnection) {
     username: item.username,
     // Never populated: the API does not return it. Left blank means unchanged.
     password: '',
-    description: item.description ?? '',
     options: Object.fromEntries(
       Object.entries(item.options ?? {}).map(([key, value]) => [key, String(value ?? '')]),
     ),
@@ -115,7 +112,6 @@ async function submit() {
         .map((field) => [field.key, (form.options[field.key] ?? '').trim()])
         .filter(([, value]) => value !== ''),
     ),
-    description: form.description.trim() || null,
   }
   const ok = editing.value
     ? await store.update(editing.value.connection_id, payload)
@@ -173,7 +169,6 @@ async function handleDelete(item: DataConnection) {
             <span v-if="item.username">· {{ item.username }}</span>
             <span v-if="!item.has_password" class="ds-warn">· 未设置密码</span>
           </div>
-          <p v-if="item.description" class="ds-desc">{{ item.description }}</p>
           <p
             v-if="store.testResults[item.connection_id]"
             class="ds-test"
@@ -259,11 +254,6 @@ async function handleDelete(item: DataConnection) {
           <input v-model="form.options[field.key]" type="text" :placeholder="field.placeholder" />
         </div>
 
-        <div class="field">
-          <label>备注</label>
-          <input v-model="form.description" type="text" placeholder="选填" />
-        </div>
-
         <p v-if="formError" class="form-error">{{ formError }}</p>
 
         <div class="ds-modal-actions">
@@ -319,7 +309,6 @@ async function handleDelete(item: DataConnection) {
 .ds-meta { font-size: 12px; color: var(--color-text-light); display: flex; gap: 6px; flex-wrap: wrap; }
 .ds-meta code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
 .ds-warn { color: var(--color-warning); }
-.ds-desc { margin: 6px 0 0; font-size: 12px; color: var(--color-text-medium); }
 .ds-test { margin: 8px 0 0; font-size: 12px; color: var(--color-error); }
 .ds-test.ok { color: var(--color-success); }
 

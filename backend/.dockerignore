@@ -1,0 +1,27 @@
+# Secrets never enter the image. The deployment supplies them as environment
+# variables, so a copy baked into a layer would be both wrong and permanent —
+# layers survive `docker rmi` of the tag and travel inside `docker save`.
+.env
+.env.*
+!.env.example
+
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+tests/
+example/
+sql/
+*.md
+requirements-dev.txt
+
+# Local state from a dev run: uploads, generated reports, logs.
+var/
+state/
+data/
+artifacts/
+logs/

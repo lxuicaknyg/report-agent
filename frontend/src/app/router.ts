@@ -1,3 +1,4 @@
+import { moduleRoutes } from './modules'
 import { createRouter, createWebHistory } from 'vue-router'
 import { useAuthStore } from '../stores'
 
@@ -16,6 +17,11 @@ const router = createRouter({
       redirect: '/conversations/new',
       meta: { requiresAuth: true },
       children: [
+        {
+          // The report workspace: these routes get the session sidebar.
+          path: '',
+          component: () => import('../pages/ReportLayout.vue'),
+          children: [
         {
           path: 'datasets',
           name: 'datasets',
@@ -70,12 +76,11 @@ const router = createRouter({
           component: () => import('../features/conversations/ConversationView.vue'),
           meta: { nav: 'reports' },
         },
-        {
-          path: 'capabilities',
-          name: 'capabilities',
-          component: () => import('../features/capabilities/CapabilitiesPlaceholderPage.vue'),
-          meta: { nav: 'capabilities' },
+          ],
         },
+        // Tools contributed by other teams. Each one gets its own top-bar
+        // entry, and inherits the login that implies — nothing else.
+        ...moduleRoutes(),
       ],
     },
     { path: '/:pathMatch(.*)*', name: 'not-found', component: () => import('../pages/NotFoundPage.vue') },

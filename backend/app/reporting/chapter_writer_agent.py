@@ -12,9 +12,12 @@ from ..core.models import Evidence, RequestContext, User
 from ..core.ports import LlmService
 from ..core.reports import (
     MetricFinding,
+    QuestionExpectation,
     ChapterDraft,
+    ChapterSupplement,
     ChapterWriterInput,
     ChapterWriterResult,
+    ReportFact,
     ReportGenerationSession,
     UserQuestion,
 )
@@ -105,16 +108,54 @@ class ChapterWriterAgent(ChapterWriter):
         cache: dict[str, dict[str, Any]] = {}
         findings: list[MetricFinding] = []
         evidence: list[Evidence] = []
-        unresolved: list[tuple[str, str]] = []
+        #: metric, why it could not be read, and what the model thinks the
+        #: user would have to supply instead (None when it did not say).
+        unresolved: list[tuple[str, str, Any]] = []
 
-        targets = [metric for metric in input.metrics if metric not in set(input.dropped_metrics)]
-        if not targets and self._table_headers(input):
+        # A supplied metric is settled by definition: the user has already given
+        # the number, and the data it could not be found in has not changed.
+        # Researching it again can only rediscover that it is missing, which
+        # comes back as the very question the user just answered.
+        settled = set(input.dropped_metrics) | {item.metric for item in input.supplements}
+        targets = [metric for metric in input.metrics if metric not in settled]
+        table_target = f"{input.section.title}表格所需数据"
+        if not targets and self._table_headers(input) and table_target not in settled:
             # A chapter can carry a table without carrying a named metric; the
-            # table still needs this period's rows.
-            targets = [f"{input.section.title}表格所需数据"]
+            # table still needs this period's rows. Settled is checked here for
+            # the same reason it is checked above, and it has to be: this name
+            # is synthesized rather than planned, so dropping it removes nothing
+            # from the plan and cannot stop the chapter asking again. Without
+            # this guard an empty `targets` means both "this chapter never had
+            # metrics" and "its metrics are all answered", and the second case
+            # re-asks for a table the user has already filled.
+            targets = [table_target]
         if not targets:
             # Narrative chapters carry no metrics and need no data of their own.
             return {"status": "ready_for_writing", "findings": [], "evidence": []}
+
+        if not input.data_sources:
+            # Nothing to read. Letting research run anyway would put the model
+            # in a loop of tool calls that all come back "dataset not allowed",
+            # and that error is non-retryable, so the chapter would fail the
+            # whole run instead of asking the user for the numbers.
+            logger.info(
+                "chapter_research_skipped session_id=%s section_id=%s metrics=%d reason=no_data_sources",
+                session.session_id, input.section.section_id, len(targets),
+            )
+            return {
+                "status": "waiting_user",
+                "questions": [
+                    UserQuestion(
+                        question_id=f"question_{uuid4().hex}",
+                        chapter_id=input.section.section_id,
+                        metric=metric,
+                        content=f"本次没有上传数据文件，请补充「{metric}」，或选择不写入报告。",
+                    )
+                    for metric in targets
+                ],
+                "findings": [],
+                "evidence": [],
+            }
 
         for index, metric in enumerate(targets, start=1):
             if checkpoint is not None:
@@ -139,6 +180,7 @@ class ChapterWriterAgent(ChapterWriter):
                         value=outcome["value"],
                         basis=outcome.get("basis"),
                         reads=outcome["reads"],
+                        evidence_ids=outcome.get("evidence_ids") or [],
                     )
                 )
                 evidence.extend(outcome["evidence"])
@@ -156,7 +198,7 @@ class ChapterWriterAgent(ChapterWriter):
                 )
             else:
                 reason = outcome.get("reason") or "未能在数据源中定位该指标"
-                unresolved.append((metric, reason))
+                unresolved.append((metric, reason, outcome.get("needs")))
                 logger.info(
                     "metric_unresolved session_id=%s section_id=%s metric=%s reason=%s",
                     session.session_id, input.section.section_id, metric, preview(reason, limit=300),
@@ -167,7 +209,7 @@ class ChapterWriterAgent(ChapterWriter):
             session.session_id,
             input.section.section_id,
             len(findings),
-            [metric for metric, _ in unresolved] or "-",
+            [metric for metric, _, _ in unresolved] or "-",
             len(cache),
         )
         if unresolved:
@@ -180,10 +222,10 @@ class ChapterWriterAgent(ChapterWriter):
                         question_id=f"question_{uuid4().hex}",
                         chapter_id=input.section.section_id,
                         metric=metric,
-                        expected="dataset",
+                        expected=self._expectation(metric, input, needs),
                         content=reason,
                     )
-                    for metric, reason in unresolved
+                    for metric, reason, needs in unresolved
                 ],
                 "findings": findings,
                 "evidence": evidence,
@@ -205,6 +247,8 @@ class ChapterWriterAgent(ChapterWriter):
         ]
         reads: list[dict[str, Any]] = []
         evidence: list[Evidence] = []
+        #: Every read this metric leaned on, cache hits included.
+        evidence_ids: list[str] = []
         error_counts: dict[str, int] = {}
         challenged = False
         nudges = 0
@@ -239,7 +283,16 @@ class ChapterWriterAgent(ChapterWriter):
                             }
                         )
                         continue
-                    return {"status": "unresolved", "reason": str(decision.get("reason") or "")}
+                    return {
+                        "status": "unresolved",
+                        "reason": str(decision.get("reason") or ""),
+                        # What the chapter would need from the user instead:
+                        # one figure, or the rows behind it. The model has just
+                        # spent a dozen reads on this metric and knows which;
+                        # asking the user to classify their own answer afterwards
+                        # is asking the person with the least context.
+                        "needs": decision.get("needs"),
+                    }
                 if status == "resolved":
                     value = str(decision.get("value") or "").strip()
                     if value:
@@ -249,6 +302,7 @@ class ChapterWriterAgent(ChapterWriter):
                             "basis": str(decision.get("basis") or "").strip() or None,
                             "reads": reads,
                             "evidence": evidence,
+                            "evidence_ids": evidence_ids,
                         }
                 # The model routinely works the calculation out in prose and
                 # never emits the JSON; the answer is right there, so keep
@@ -269,16 +323,28 @@ class ChapterWriterAgent(ChapterWriter):
                 cached = cache.get(cache_key)
                 if cached is not None:
                     result_payload, success, detail = cached["payload"], True, "cache"
+                    # Reusing another metric's read must not cost this metric
+                    # its provenance: claim the same evidence by id rather than
+                    # recording the query a second time.
+                    evidence_ids.extend(cached["evidence_ids"])
                 else:
                     result = await self._execute_read_tool(name, arguments, input, context)
                     success = result.success
                     result_payload = self._tool_data_payload(result) if success else None
                     detail = preview(result.data if success else result.error, limit=300)
                     if success:
-                        cache[cache_key] = {"payload": result_payload}
-                        evidence.extend(
-                            item for item in result.evidence if isinstance(item, Evidence)
-                        )
+                        fresh = [item for item in result.evidence if isinstance(item, Evidence)]
+                        for item in fresh:
+                            # Which metric asked for this read. The chapter used
+                            # to hold one flat pool of evidence with no way to
+                            # tell which of its numbers each entry produced.
+                            item.metadata = {**item.metadata, "metric": metric, "tool": name}
+                        cache[cache_key] = {
+                            "payload": result_payload,
+                            "evidence_ids": [item.evidence_id for item in fresh],
+                        }
+                        evidence.extend(fresh)
+                        evidence_ids.extend(item.evidence_id for item in fresh)
                 logger.info(
                     "chapter_tool_call session_id=%s section_id=%s metric=%s tool=%s success=%s args=%s result=%s",
                     session.session_id,
@@ -400,7 +466,7 @@ class ChapterWriterAgent(ChapterWriter):
         # Questions are the signal, not the status field: a model that hedges in
         # the prose while reporting "completed" would otherwise have its request
         # for data silently dropped.
-        questions = self._questions(payload.get("questions", []))
+        questions = self._questions(payload.get("questions", []), input)
         if questions or payload.get("status") == "waiting_user":
             # A chapter that parks with nothing to ask would stall the run in
             # silence, so fall back to asking for the metrics it was planned to
@@ -419,15 +485,110 @@ class ChapterWriterAgent(ChapterWriter):
             str(payload.get("content") or response.get("content", "")).strip(),
             input.section.title,
         )
+        # Research is where every number was decided, so the chapter keeps that
+        # record: without it the settled values lived only for the length of the
+        # run and a finished report could not say where a figure came from.
+        settled = findings + self._supplement_findings(input)
         draft = ChapterDraft(
             chapter_id=input.section.section_id,
             section_id=input.section.section_id,
             title=input.section.title,
             content=content,
             evidence=evidence,
+            findings=settled,
+            facts=self._facts(settled),
             assumptions=self._string_list(payload.get("assumptions")),
         )
         return ChapterWriterResult(status="completed", draft=draft)
+
+    @staticmethod
+    def _supplement_findings(input: ChapterWriterInput) -> list[MetricFinding]:
+        """User-supplied numbers, recorded the same way as researched ones.
+
+        A value the user typed in is as much a source as a query result, and a
+        reader checking the chapter needs to see that it was supplied rather
+        than measured.
+        """
+        findings = []
+        for item in input.supplements:
+            if item.value is None and not item.rows:
+                continue
+            value = item.value
+            if value is None:
+                # A detail table has no single figure. The finding still exists
+                # so the metric is listed in provenance, and says what it is
+                # rather than pretending to be a number.
+                value = f"明细 {len(item.rows)} 行 × {len(item.columns)} 列"
+            findings.append(
+                MetricFinding(
+                    metric=item.metric,
+                    value=value,
+                    basis=ChapterWriterAgent._supplement_basis(item),
+                    reads=(
+                        [
+                            {
+                                "kind": "sql",
+                                "connection_id": item.connection_id,
+                                "connection_name": item.connection_name,
+                                "sql": item.query,
+                                "dimensions": item.dimensions,
+                                "columns": item.columns,
+                                "rows": item.rows,
+                                "rows_truncated": item.rows_truncated,
+                            }
+                        ]
+                        if item.query
+                        else []
+                    ),
+                )
+            )
+        return findings
+
+    @staticmethod
+    def _supplement_payload(item: ChapterSupplement) -> dict[str, Any]:
+        """A supplement as the model should see it.
+
+        Empty dimensions are left out rather than sent as ``{}``: the prompt
+        repeats this object per metric, and a key that is always blank for
+        typed-in values teaches the model nothing.
+        """
+        payload = item.model_dump(exclude_none=True)
+        for key in ("dimensions", "columns", "rows", "rows_truncated"):
+            if not payload.get(key):
+                payload.pop(key, None)
+        return payload
+
+    @staticmethod
+    def _supplement_basis(item: ChapterSupplement) -> str:
+        """How a supplied value is described where the chapter cites it.
+
+        The dimensions are spelled out because they are the only thing that
+        distinguishes one period's figure from another's: a value fetched
+        without them means no more than its metric name claims.
+        """
+        origin = "用户 SQL 取数" if item.source == "sql" else "用户补充"
+        parts = [f"{name}={value}" for name, value in item.dimensions.items()]
+        if item.rows:
+            detail = f"明细 {len(item.rows)} 行"
+            if item.rows_truncated:
+                detail += "（已截断）"
+            parts.append(detail)
+        if item.note:
+            parts.append(item.note)
+        return f"{origin}（{'；'.join(parts)}）" if parts else origin
+
+    @staticmethod
+    def _facts(findings: list[MetricFinding]) -> list[ReportFact]:
+        """One fact per settled metric, carrying its evidence ids."""
+        return [
+            ReportFact(
+                fact_id=f"fact_{uuid4().hex[:12]}",
+                label=finding.metric,
+                value=finding.value,
+                evidence_ids=list(finding.evidence_ids),
+            )
+            for finding in findings
+        ]
 
     async def _execute_read_tool(
         self,
@@ -546,8 +707,8 @@ class ChapterWriterAgent(ChapterWriter):
     def _json_text(value: Any) -> str:
         return json.dumps(value, ensure_ascii=False, default=str)
 
-    @staticmethod
-    def _questions(values: Any) -> list[UserQuestion]:
+    @classmethod
+    def _questions(cls, values: Any, input: ChapterWriterInput) -> list[UserQuestion]:
         if not isinstance(values, list):
             values = [values] if isinstance(values, dict) else []
         result: list[UserQuestion] = []
@@ -558,8 +719,19 @@ class ChapterWriterAgent(ChapterWriter):
             if not isinstance(value, dict) or not value.get("content"):
                 continue
             # The model is not asked to invent ids, and a missing one must not
-            # fail the whole report.
-            payload = {"question_id": f"question_{uuid4().hex}", **value}
+            # fail the whole report. Its `expected` is normalised the same way:
+            # a question dropped because the model wrote "detail" instead of
+            # "table" is a chapter that waits forever for an answer nobody was
+            # asked for.
+            payload = {
+                "question_id": f"question_{uuid4().hex}",
+                **value,
+                "expected": cls._expectation(
+                    str(value.get("metric") or value.get("content") or ""),
+                    input,
+                    value.get("expected"),
+                ),
+            }
             try:
                 result.append(UserQuestion.model_validate(payload))
             except ValidationError as exc:
@@ -574,14 +746,61 @@ class ChapterWriterAgent(ChapterWriter):
             return [str(item) for item in value]
         return [str(value)]
 
+    #: Metric names that describe a list rather than a figure. The user is
+    #: never asked to classify their own answer, so when the model does not
+    #: say, the wording of the metric is the next best evidence — "分行贷款
+    #: 明细" is rows, "不良贷款余额" is a number.
+    _LIST_WORDS = (
+        "明细", "清单", "名单", "列表", "分项", "构成", "分布", "排名", "排行",
+        "前十", "前 10", "top", "TOP", "逐笔", "逐户", "各项",
+    )
+
+    @classmethod
+    def _expectation(
+        cls,
+        metric: str,
+        input: ChapterWriterInput,
+        declared: Any = None,
+    ) -> QuestionExpectation:
+        """What kind of answer this question needs.
+
+        The model's own word wins: it has just tried to read the metric and
+        knows whether the chapter wanted one number or a table. When it says
+        nothing usable, the chapter's template and the metric's wording decide
+        — a metric named in a table's header is that table's content.
+
+        Getting this wrong is recoverable by design: the question card lets the
+        user record a list against a question we called a figure. What is not
+        recoverable is asking them to choose upfront, every time, which is
+        what this replaces.
+        """
+        if declared in {"value", "table", "text"}:
+            return declared
+        if declared == "dataset":
+            # The kind that used to mean "needs another dataset" and offered
+            # no way to supply one.
+            return "value"
+        name = (metric or "").strip()
+        if not name:
+            return "text"
+        for header in cls._table_headers(input):
+            cells = header if isinstance(header, list) else [header]
+            if any(name and name in str(cell) for cell in cells):
+                return "table"
+        lowered = name.lower()
+        if any(word.lower() in lowered for word in cls._LIST_WORDS):
+            return "table"
+        return "value"
+
     @staticmethod
     def _fallback_question(input: ChapterWriterInput, reason: str) -> UserQuestion:
         summary = " ".join(reason.split())
+        metric = "、".join(input.metrics) or input.section.title
         return UserQuestion(
             question_id=f"question_{uuid4().hex}",
             chapter_id=input.section.section_id,
-            metric="、".join(input.metrics) or input.section.title,
-            expected="dataset",
+            metric=metric,
+            expected=ChapterWriterAgent._expectation(metric, input),
             content=(summary[:200] or f"「{input.section.title}」缺少可用数据，请补充后继续。"),
         )
 
@@ -589,6 +808,7 @@ class ChapterWriterAgent(ChapterWriter):
     def _research_question(result: ToolResult) -> UserQuestion:
         return UserQuestion(
             question_id=f"question_{uuid4().hex}",
+            expected="text",
             content="请确认本章节需要读取的数据范围或字段。",
             reason=result.result_for_llm,
         )
@@ -617,7 +837,10 @@ class ChapterWriterAgent(ChapterWriter):
             "value 里的每一个数字都必须原样抄自工具返回，不得四舍五入成另一个数、不得自行折算单位；"
             "该条回复必须只包含这个 JSON 对象，不要输出计算过程——只写在文字里的结果会被丢弃；"
             "需要多个分项时把它们一并写进 value（例如「华东 63,172,480 元；华南 37,061,440 元」）。"
-            "确实无法从任何数据源得到该指标，才返回 {\"status\":\"unresolved\",\"reason\":\"...\"}——"
+            "确实无法从任何数据源得到该指标，才返回 "
+            "{\"status\":\"unresolved\",\"reason\":\"...\",\"needs\":\"value\"|\"table\"}——"
+            "needs 说明要让用户补什么：本章正文里引用的一个数写 value，"
+            "要填进模板表格、或本身就是一份逐行清单的写 table；"
             "用户没有补充的指标会被直接从报告里去掉，所以这不是失败，不要为了凑一个数而自己估算。"
         )
 
@@ -643,7 +866,7 @@ class ChapterWriterAgent(ChapterWriter):
             "table_headers": table_headers,
             "global_context": input.global_context.model_dump(),
             "user_instruction": input.user_instruction,
-            "supplements": [item.model_dump(exclude_none=True) for item in input.supplements],
+            "supplements": [ChapterWriterAgent._supplement_payload(item) for item in input.supplements],
             "metric": metric,
         }
 
@@ -679,14 +902,22 @@ class ChapterWriterAgent(ChapterWriter):
             "4) findings 是取数阶段已经算定的取值：正文和表格中的每一个数字都必须直接引用 "
             "findings.value 或 supplements.value，不得重新计算、不得改写成另一个数，"
             "更不得让正文与表格对同一个量给出不同的值；需要派生的比例或差额也必须由这些既定值算出并前后一致；\n"
-            "5) supplements 是用户补充的取值，note 是其口径，同样直接使用；\n"
+
+            "5) supplements 是用户补充的数据，note 是其口径；value 是单个取值，"
+            "dimensions 是该取值所属的维度（如统计日期、机构），直接使用；"
+            "dimensions 为空时该值只对应 metric 本身，不要替它补上任何未声明的时间或口径；"
+            "若 supplements 带的是 columns 与 rows，则该指标是一张明细清单而不是一个数："
+            "按 columns 的列序把 rows 原样写成表格，不要改列名、不要重排、不要只挑几行写，"
+            "也不要自己对这些行做求和或求比例；rows_truncated 为 true 时说明只给了前若干行，"
+            "需在表下注明数据已截断；\n"
             "6) dropped_metrics 中的指标已被用户移除：正文中不得出现相关表述，"
             "也不要说明它为什么缺失，当作报告从未要求过这个指标；\n"
             "7) metrics 为空时本章不承载数据指标（前言、说明、数据来源这类叙述性章节），"
             "依据 blocks 改写成正式表述即可，不要因为缺数据而提问；\n"
             "8) 某个 metrics 在 findings 和 supplements 中都没有时，不要估算也不要一句“暂无法判断”带过，"
             "用 questions 抛出：question 需带 metric（缺的指标名）和 expected"
-            "（value 表示一个数值，dataset 表示需要另一份数据），content 说明为什么需要它。"
+            "（value 表示正文里引用的一个数值，table 表示要填进表格或本身就是逐行清单的一份明细，"
+            "text 表示一段文字说明），content 说明为什么需要它。"
             "只要抛出了 questions，status 就必须是 waiting_user，"
             "不要一边在正文写“待补充后再计算”一边把 status 标成 completed；"
             "findings 里已经给出的指标不得再声称缺失。\n"
@@ -732,7 +963,7 @@ class ChapterWriterAgent(ChapterWriter):
                 {"metric": item.metric, "value": item.value, "basis": item.basis}
                 for item in findings
             ],
-            "supplements": [item.model_dump(exclude_none=True) for item in input.supplements],
+            "supplements": [ChapterWriterAgent._supplement_payload(item) for item in input.supplements],
             "dropped_metrics": input.dropped_metrics,
         }
 
@@ -799,6 +1030,6 @@ class ChapterWriterAgent(ChapterWriter):
             "report_outline": input.report_outline,
             "data_sources": [source.model_dump() for source in input.data_sources],
             "user_instruction": input.user_instruction,
-            "supplements": [item.model_dump() for item in input.supplements],
+            "supplements": [ChapterWriterAgent._supplement_payload(item) for item in input.supplements],
             "dropped_metrics": input.dropped_metrics,
         }

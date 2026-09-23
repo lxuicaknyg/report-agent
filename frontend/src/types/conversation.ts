@@ -15,7 +15,13 @@ export interface PlanMessagePayload {
   plan: ReportPlan
 }
 
-export type ChapterProgressStatus = 'pending' | 'running' | 'completed' | 'waiting_user'
+export type ChapterProgressStatus =
+  | 'pending'
+  | 'running'
+  | 'completed'
+  | 'waiting_user'
+  /** 跑被停掉或失败时停在的那一章，说「继续」会从这里接着写。 */
+  | 'stopped'
 
 export interface ProgressChapter {
   section_id: string
@@ -28,9 +34,21 @@ export interface ProgressChapter {
 /** One decision the user made about a missing metric. */
 export interface QuestionResolutionInput {
   question_id: string
-  action: 'value' | 'sql' | 'drop'
+  action: 'value' | 'sql' | 'table' | 'drop'
   value?: string
   note?: string
+  /** Set for `action: 'sql'` only. The backend re-runs the statement and reads
+   * the value out of it, so no value is sent for this action. */
+  connection_id?: string
+  query?: string
+  /** Set for `action: 'table'` only: the rows as they were pasted. The backend
+   * parses them, so what lands in the report is the same read of the same text
+   * the preview showed. */
+  text?: string
+  /** Says this question was classified wrongly: it was raised as a single
+   * figure and is being answered with a list. How a query is read comes from
+   * the question, not from a mode the user picks — this is the correction. */
+  as_table?: boolean
 }
 
 export interface QuestionMessagePayload {

@@ -7,7 +7,7 @@ from openpyxl import Workbook
 
 from app.conversations.orchestrator import ConversationOrchestrator
 from app.core.ports import LlmService
-from app.core.reports import ReportGenerationStatus
+from app.core.reports import ReportGenerationStatus, UserInputRejected
 from app.data.catalog import DataCatalog
 from app.infrastructure.artifact_store import InMemoryArtifactStore
 from app.infrastructure.conversation_repositories import InMemoryConversationRepository
@@ -219,8 +219,14 @@ def test_second_report_in_one_conversation_is_refused():
 
 
 def test_a_question_asked_before_any_report_gets_answered():
+    """A first message can now be a brief the model turns into a plan, so it is
+    classified before it is answered; a question must still come back as one."""
+
     async def run():
-        llm = ScriptedLlm(["净息差 = 利息净收入 / 平均生息资产。"])
+        llm = ScriptedLlm([
+            '{"intent": "chat"}',
+            "净息差 = 利息净收入 / 平均生息资产。",
+        ])
         orchestrator = build_orchestrator(llm)
         conversation = await orchestrator.create_conversation("local-user")
         replies = await send(orchestrator, conversation.conversation_id, "净息差怎么算？")
@@ -535,5 +541,71 @@ def test_saying_continue_after_a_stop_picks_up_the_unwritten_chapter():
         assert resumed.status == ReportGenerationStatus.COMPLETED
         # section_1 was on disk before the stop and is not written twice.
         assert writer.written == ["section_1", "section_2"]
+
+    asyncio.run(run())
+
+
+def test_a_validation_message_does_not_send_the_user_to_the_log():
+    """Being told to use the card is the whole explanation. Pointing at a
+    backend log the user cannot read makes their own mistake look like a fault."""
+    orchestrator = build_orchestrator()
+
+    rejected = orchestrator._error_text(UserInputRejected("本章还有 2 项待处理，请在上方卡片中逐项确认后提交"))
+    assert rejected == "本章还有 2 项待处理，请在上方卡片中逐项确认后提交"
+    assert "后端日志" not in rejected
+
+    # A genuine failure still points at where the detail lives.
+    assert "后端日志" in orchestrator._error_text(RuntimeError("boom"))
+
+
+def test_a_template_on_its_own_is_enough_to_start():
+    """The user has last period's report and this period's numbers are not in a
+    spreadsheet yet. Requiring both files turned that into free-form chat."""
+
+    async def run():
+        orchestrator = build_orchestrator()
+        conversation = await orchestrator.create_conversation("local-user")
+
+        await send(
+            orchestrator,
+            conversation.conversation_id,
+            "按这份模板生成本期报告",
+            template_filename="模板.md",
+            template_content=TEMPLATE_BYTES,
+        )
+
+        stored = await orchestrator.conversations.get(conversation.conversation_id)
+        assert stored.report_session_id, "a template-only upload must create a session"
+        session = await orchestrator.reports.sessions.get(stored.report_session_id)
+        # No data file: the report is written from figures the user supplies.
+        assert session.dataset_ids == []
+        assert session.plan is not None
+        messages = await orchestrator.conversations.list_messages(conversation.conversation_id)
+        assert [m.kind for m in messages if m.role == "assistant"] == ["plan"]
+
+    asyncio.run(run())
+
+
+def test_without_a_model_an_upload_alone_asks_for_more():
+    """Proposing a structure takes a model. With none configured there is
+    nothing to plan from, so a bare spreadsheet gets the upload hint rather
+    than a session that could only fail."""
+
+    async def run():
+        orchestrator = build_orchestrator()
+        conversation = await orchestrator.create_conversation("local-user")
+
+        await send(
+            orchestrator,
+            conversation.conversation_id,
+            "用这份数据做点什么",
+            data_filename="数据.xlsx",
+            data_content=excel_bytes(),
+        )
+
+        stored = await orchestrator.conversations.get(conversation.conversation_id)
+        assert not stored.report_session_id
+        messages = await orchestrator.conversations.list_messages(conversation.conversation_id)
+        assert [m.kind for m in messages if m.role == "assistant"] == ["text"]
 
     asyncio.run(run())

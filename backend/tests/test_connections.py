@@ -91,13 +91,20 @@ def test_urls_escape_credentials():
     assert ConnectionService.sqlalchemy_url(gauss).startswith("postgresql+psycopg://")
 
 
-def test_openlookeng_needs_its_jdbc_jar():
+def test_openlookeng_saves_with_only_a_catalog():
+    """jar 路径不再是用户输入。
+
+    它曾经是必填项，但那既是错的设计（jar 是部署产物）也是假的实现（JPype 一个
+    进程只能启一次 JVM，第一个连接的 jar 会对之后所有连接生效）。现在由部署挂载
+    到 deploy/jdbc/，用户只填 catalog。
+    """
+
     async def run():
         service = build_service()
-        with pytest.raises(ValueError, match="jar"):
-            await service.create(
-                mysql_input(driver=ConnectionDriver.OPENLOOKENG, options={"catalog": "hive"})
-            )
+        created = await service.create(
+            mysql_input(driver=ConnectionDriver.OPENLOOKENG, options={"catalog": "bhive"})
+        )
+        assert created.options == {"catalog": "bhive"}
 
     asyncio.run(run())
 
@@ -157,9 +164,11 @@ def test_driver_catalogue_is_served_for_the_form():
     assert set(drivers) == {"mysql", "gaussdb", "openlookeng"}
     assert drivers["gaussdb"]["driver_package"].startswith("psycopg")
     assert drivers["mysql"]["driver_package"].startswith("pymysql")
-    # openLooKeng's extra fields drive the generated form.
+    # openLooKeng's extra fields drive the generated form. The jar path and
+    # driver class used to be here; they are deployment concerns now, so the
+    # form asks only for what the user actually chooses.
     keys = {field["key"] for field in drivers["openlookeng"]["extra_fields"]}
-    assert {"catalog", "jdbc_jar_path"} <= keys
+    assert keys == {"catalog", "schema"}
 
 
 def test_connections_survive_a_restart():

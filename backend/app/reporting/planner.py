@@ -63,6 +63,176 @@ class ReportPlanner:
             assembly_order=[chapter.section_id for chapter in chapter_plans],
         )
 
+    async def create_outline(
+        self,
+        instruction: str,
+        data_sources: list[DataSourceMetadata] | None = None,
+        title: str | None = None,
+    ) -> ReportPlan:
+        """Invent a report structure from a sentence, with no template to follow.
+
+        The user has described the report they want but has nothing to copy the
+        shape from, so the model proposes the chapters. Here the plan is the
+        authority — there is no template tree to validate against, and the
+        section ids are ours to hand out.
+
+        When a data file came with the brief, the structure is proposed from
+        what is actually in it. Planning blind against real data is the worst
+        of both: the model names metrics the columns cannot answer, and every
+        one of them becomes a question the user has to fill in by hand.
+        """
+        if self.llm is None:
+            raise ValueError("Planning without a template requires a configured model")
+        sources = data_sources or []
+        response = await self.llm.complete(
+            [
+                {"role": "system", "content": self._outline_system_prompt(bool(sources))},
+                {
+                    "role": "user",
+                    "content": json.dumps(
+                        {
+                            "instruction": instruction,
+                            "title": title,
+                            "data_sources": [item.model_dump(mode="json") for item in sources],
+                        },
+                        ensure_ascii=False,
+                    ),
+                },
+            ],
+            [],
+        )
+        payload = self._parse_json(response.get("content", ""))
+        chapters, global_context, model_title = self._parse_outline_payload(payload)
+        return ReportPlan(
+            plan_id=f"plan_{uuid4().hex}",
+            status="awaiting_confirmation",
+            # Filled in by the caller once the outline has been turned into a
+            # template; the plan and its template are created together.
+            template_id="",
+            title=title or model_title or "分析报告",
+            instruction=instruction,
+            global_context=global_context,
+            chapters=chapters,
+            assembly_order=[chapter.section_id for chapter in chapters],
+        )
+
+    async def revise_outline(
+        self,
+        plan: ReportPlan,
+        feedback: str,
+    ) -> ReportPlan:
+        """Revise a conversation-authored plan.
+
+        Unlike a template-backed revision this may add chapters: the
+        conversation is what decides the report's shape, so a request for a new
+        section is a legitimate revision rather than an unknown section id.
+        """
+        if self.llm is None:
+            raise ValueError("Plan revision requires a configured model")
+        response = await self.llm.complete(
+            [
+                {"role": "system", "content": self._revise_outline_system_prompt()},
+                {
+                    "role": "user",
+                    "content": json.dumps(
+                        {
+                            "current_plan": plan.model_dump(mode="json"),
+                            "original_instruction": plan.instruction,
+                            "revision_request": feedback,
+                        },
+                        ensure_ascii=False,
+                    ),
+                },
+            ],
+            [],
+        )
+        payload = self._parse_json(response.get("content", ""))
+        chapters, global_context, model_title = self._parse_outline_payload(
+            payload, previous=plan
+        )
+        return plan.model_copy(
+            update={
+                "version": plan.version + 1,
+                "status": "awaiting_confirmation",
+                "title": model_title or plan.title,
+                "global_context": global_context,
+                "chapters": chapters,
+                "assembly_order": [chapter.section_id for chapter in chapters],
+            }
+        )
+
+    def _parse_outline_payload(
+        self,
+        payload: dict[str, Any],
+        previous: ReportPlan | None = None,
+    ) -> tuple[list[ChapterPlan], ReportGlobalContext, str]:
+        """Read a plan the model invented, assigning ids rather than checking them.
+
+        Section ids are never the model's to choose: it is asked for titles, and
+        a chapter that matches one already in the plan keeps its id so drafts
+        and answers already tied to it survive the revision.
+        """
+        if not payload:
+            raise ValueError("Report planner model returned invalid JSON")
+        raw_chapters = payload.get("chapters")
+        if not isinstance(raw_chapters, list) or not raw_chapters:
+            raise ValueError("Report planner model must return chapters")
+
+        existing = {
+            chapter.title.strip(): chapter
+            for chapter in (previous.chapters if previous else [])
+        }
+        used: set[str] = set()
+        chapters: list[ChapterPlan] = []
+        for index, raw in enumerate(raw_chapters, start=1):
+            if not isinstance(raw, dict):
+                raise ValueError("Each report planner chapter must be an object")
+            title = self._required_title(raw.get("title"), f"chapter_{index}")
+            metrics = raw.get("metrics", [])
+            if not isinstance(metrics, list) or not all(isinstance(item, str) for item in metrics):
+                raise ValueError(f"Metrics must be a string list for chapter: {title}")
+            carried = existing.get(title.strip())
+            section_id = carried.section_id if carried and carried.section_id not in used else f"section_{index}"
+            used.add(section_id)
+            chapters.append(
+                ChapterPlan(
+                    section_id=section_id,
+                    title=title,
+                    level=1,
+                    metrics=self._clean_metrics(metrics),
+                    subsections=self._parse_outline_subsections(
+                        raw.get("subsections"), section_id, carried
+                    ),
+                )
+            )
+
+        context = self._parse_global_context(payload.get("global_context", {}))
+        return chapters, context, str(payload.get("title") or "").strip()
+
+    def _parse_outline_subsections(
+        self,
+        raw: Any,
+        parent_id: str,
+        carried: ChapterPlan | None,
+    ) -> list[SubchapterPlan]:
+        if not isinstance(raw, list):
+            return []
+        known = {item.title.strip(): item for item in (carried.subsections if carried else [])}
+        result: list[SubchapterPlan] = []
+        for index, item in enumerate(raw, start=1):
+            title = item.get("title") if isinstance(item, dict) else item
+            if not isinstance(title, str) or not title.strip():
+                continue
+            previous = known.get(title.strip())
+            result.append(
+                SubchapterPlan(
+                    section_id=previous.section_id if previous else f"{parent_id}_{index}",
+                    title=title.strip(),
+                    level=2,
+                )
+            )
+        return result
+
     async def revise_plan(
         self,
         plan: ReportPlan,
@@ -262,15 +432,7 @@ class ReportPlanner:
         elif not chapters_by_id:
             raise ValueError("A revised report plan must keep at least one chapter")
 
-        raw_context = payload.get("global_context", {})
-        if not isinstance(raw_context, dict):
-            raise ValueError("Report planner returned an invalid global_context")
-        try:
-            global_context = ReportGlobalContext.model_validate(
-                {**raw_context, "dimensions": self._coerce_dimensions(raw_context.get("dimensions"))}
-            )
-        except Exception as exc:
-            raise ValueError("Report planner returned an invalid global_context") from exc
+        global_context = self._parse_global_context(payload.get("global_context", {}))
         model_title = str(payload.get("title") or template.title).strip()
         if not model_title:
             raise ValueError("Report planner returned an empty report title")
@@ -313,6 +475,72 @@ class ReportPlanner:
         return planned
 
     @staticmethod
+    def _outline_system_prompt(has_data: bool = False) -> str:
+        grounding = (
+            "用户上传了数据文件但没有提供模板。请先看 data_sources 里各 sheet 的列、"
+            "value_enums（列的全部取值）和 value_ranges（取值范围），"
+            "据此推断这份数据能支撑什么样的报告，再定章节和指标。\n"
+            "指标必须是这些数据算得出来的：列里没有的东西不要写进计划，"
+            "宁可少写一个章节，也不要写一个数据答不上来的指标——"
+            "那会变成用户必须手工填写的追问。\n"
+            "global_context.report_period 优先取自用户指令；指令没说的，"
+            "依据时间列的 value_enums 选出最新的一个完整期间；"
+            "dimensions 的取值必须来自 value_enums。\n"
+            if has_data
+            else
+            "用户没有提供模板，也没有提供数据，"
+            "请你按报告主题推断出应该包含哪些章节、每章需要哪些业务指标。\n"
+            "global_context.report_period 取自用户指令；用户没说就留空，"
+            "不要自己假定一个期间。dimensions 同理，没有依据就留空。\n"
+            "本次没有数据，指标的取值稍后会逐项向用户收集，"
+            "所以只需要判断「这份报告该讲哪些指标」，不要考虑数据从哪来。\n"
+        )
+        return (
+            "你是报告结构规划智能体。\n"
+            + grounding +
+            "1) 章节按报告的惯常写法组织，从概览到分项再到结论；"
+            "章节数量由报告主题决定，不要为凑数硬加，也不要只给一两章；\n"
+            "2) 指标写成业务口径的名字（如「累计交易金额」「不良贷款率」），"
+            "不要写成字段名，也不要写成一句话描述；每章 3-8 个为宜；\n"
+            "3) 纯叙述性的章节（前言、编制说明）metrics 给空数组；\n"
+            "4) 需要下一层展开的章节用 subsections 给出子节标题，只有一层子节；"
+            "不需要就给空数组；\n"
+            "5) 不要编造 section_id，不要输出层级编号字段——这些由系统分配；\n"
+            "返回 JSON：{\"title\": \"...\", \"global_context\": {...}, "
+            "\"chapters\": [{\"title\": \"...\", \"metrics\": [...], "
+            "\"subsections\": [{\"title\": \"...\"}]}]}"
+        )
+
+    @staticmethod
+    def _revise_outline_system_prompt() -> str:
+        return (
+            "你是报告结构规划智能体，正在和用户一起打磨一份还没开始生成的报告计划。"
+            "根据 revision_request 给出新版计划。\n"
+            "1) 这份计划的结构由对话决定：用户要加章节就加，要删就删，要改顺序就改；\n"
+            "2) 用户如果是在征求意见而不是下指令（例如「这章要哪些指标我也不知道，你推荐几个」"
+            "「这样安排合理吗」），就按你的专业判断直接把建议落进计划里，"
+            "不要只回话不改计划——用户看到的是计划本身；\n"
+            "3) 没有被提到的章节和指标保持原样，包括标题的措辞；"
+            "改动范围仅限用户要求的部分；\n"
+            "4) 不要编造 section_id，不要输出层级编号字段；\n"
+            "5) global_context 只在用户明确提到时才改；用户没给报告期间就继续留空；\n"
+            "返回 JSON，结构与当前计划相同："
+            "{\"title\": \"...\", \"global_context\": {...}, "
+            "\"chapters\": [{\"title\": \"...\", \"metrics\": [...], "
+            "\"subsections\": [{\"title\": \"...\"}]}]}"
+        )
+
+    def _parse_global_context(self, raw: Any) -> ReportGlobalContext:
+        if not isinstance(raw, dict):
+            raise ValueError("Report planner returned an invalid global_context")
+        try:
+            return ReportGlobalContext.model_validate(
+                {**raw, "dimensions": self._coerce_dimensions(raw.get("dimensions"))}
+            )
+        except Exception as exc:
+            raise ValueError("Report planner returned an invalid global_context") from exc
+
+    @staticmethod
     def _required_title(value: Any, section_id: str) -> str:
         title = str(value or "").strip()
         if not title:
@@ -334,6 +562,9 @@ class ReportPlanner:
             "同理，模板正文里的数字、排名和结论都属于历史期间，只能用来推断需要哪些指标，不能当作本期事实。"
             "计划阶段禁止确定具体 Sheet、表名、字段名、SQL、工具调用顺序或数据读取方式。"
             "全局维度的取值必须来自 value_enums，不要凭样例行猜测或漏列。"
+            "data_sources 为空时（用户只上传了模板，本次没有数据文件）："
+            "报告期间以用户指令为准，指令里也没有就留空让用户在确认计划时补；"
+            "全局维度同样留空；指标照常从模板归纳出来，后续会逐项向用户收集取值。"
             "章节层级：template.chapters 给出报告的章节树，每个 chapter 是一个顶级标题，"
             "subsections 是它下面的次级标题。指标只挂在 chapter 上，覆盖该章及其全部子节。"
             "必须只返回 JSON，不要 Markdown 或解释，格式为："

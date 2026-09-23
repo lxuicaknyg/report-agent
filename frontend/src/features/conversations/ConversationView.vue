@@ -10,19 +10,13 @@ const store = useConversationStore()
 
 const conversationId = computed(() => String(route.params.conversationId || ''))
 
-/** The route owns the selection; /conversations/new creates one on arrival. */
+/** The route owns the selection; /conversations/new is an unsaved draft. */
 async function sync(id: string) {
   if (id) {
     await store.selectConversation(id)
     return
   }
-  const created = await store.createConversation()
-  if (created) {
-    await router.replace({
-      name: 'conversation-detail',
-      params: { conversationId: created.conversation_id },
-    })
-  }
+  store.resetDraft()
 }
 
 onMounted(async () => {
@@ -33,6 +27,16 @@ onMounted(async () => {
 watch(conversationId, (id, previous) => {
   if (id !== previous) void sync(id)
 })
+
+// The first message turns the draft into a real thread; move the URL onto it
+// so a reload, a share, or the back button all land on the saved conversation.
+watch(
+  () => store.currentConversationId,
+  (id) => {
+    if (!id || route.name !== 'conversation-new') return
+    void router.replace({ name: 'conversation-detail', params: { conversationId: id } })
+  },
+)
 
 onUnmounted(() => store.stopPolling())
 </script>
